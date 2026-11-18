@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from app.api.routes import PlatformRuntimeContainer
+from app.main import create_app
 from app.simulator import ProductionTrafficSimulator
 
 
@@ -102,3 +108,72 @@ async def test_simulator_records_unexpected_tick_exception_without_crashing(tmp_
     assert ev.outcome == "error"
     assert ev.detail.get("error_type") == "RuntimeError"
     assert sim.status().outcome_counts.get("error") == 1
+
+
+def test_simulate_api_start_status_sse_stream_stop_and_audit_trail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify /api/v1/simulate/{status,start,stream,stop} and live audit trail updates."""
+    monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(tmp_path / "sim_api"))
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    app = create_app(max_request_body_bytes=512_000)
+    with TestClient(app) as client:
+        st0 = client.get("/api/v1/simulate/status")
+        assert st0.status_code == 200
+        assert st0.json()["running"] is False
+
+        bad_start = client.post("/api/v1/simulate/start", json={"interval_seconds": 0.001})
+        assert bad_start.status_code == 422
+
+        started = client.post(
+            "/api/v1/simulate/start",
+            json={"interval_seconds": 0.05, "drift_wave_every": 4},
+        )
+        assert started.status_code == 200
+        assert started.json()["running"] is True
+
+        with client.stream("GET", "/api/v1/simulate/stream", params={"max_events": 4}) as sse:
+            assert sse.status_code == 200
+            assert "text/event-stream" in sse.headers["content-type"]
+            events = [
+                json.loads(line.removeprefix("data: "))
+                for line in sse.iter_lines()
+                if line.startswith("data: ")
+            ]
+            assert len(events) == 4
+            assert {ev["pillar"] for ev in events}.issubset({"mlops", "llmops", "multimodal"})
+
+        stopped = client.post("/api/v1/simulate/stop")
+        assert stopped.status_code == 200
+        assert stopped.json()["running"] is False
+        assert stopped.json()["total_ticks"] >= 4
+
+        audit = client.get("/api/v1/audit/verify")
+        assert audit.status_code == 200
+        assert audit.json()["valid"] is True
+        assert audit.json()["records"] >= 1
+
+
+def test_simulate_lifespan_shutdown_stops_active_background_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify FastAPI lifespan exit cleanly stops an unstopped 60s simulation task in < 0.5s."""
+    monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(tmp_path / "sim_lifespan"))
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    app = create_app()
+    assert isinstance(app, FastAPI)
+    t_exit = 0.0
+    with TestClient(app) as client:
+        resp = client.post("/api/v1/simulate/start", json={"interval_seconds": 60.0})
+        assert resp.status_code == 200
+        assert resp.json()["running"] is True
+        t_exit = time.perf_counter()
+    shutdown_elapsed = time.perf_counter() - t_exit
+    assert shutdown_elapsed < 0.5
+    assert app.state.container.simulator.status().running is False

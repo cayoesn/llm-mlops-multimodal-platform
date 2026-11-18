@@ -150,6 +150,7 @@ def create_app(*, max_request_body_bytes: int = 4_194_304) -> FastAPI:
         application.state.container = container
         log_info(_LOGGER, "omnipulse_platform_started", max_body_bytes=max_request_body_bytes)
         yield
+        await container.simulator.stop()
         await container.llm_gateway.aclose()
         log_info(_LOGGER, "omnipulse_platform_shutdown")
 

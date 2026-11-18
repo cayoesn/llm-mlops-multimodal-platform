@@ -7,10 +7,12 @@ import base64
 import binascii
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 import numpy as np
 from fastapi import APIRouter, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from app.api.schemas import (
@@ -25,6 +27,8 @@ from app.api.schemas import (
     MLOpsPredictRequest,
     MLOpsPredictResponse,
     MultimodalInspectAPIRequest,
+    SimulationStartRequest,
+    SimulationStatusResponse,
     WebSocketStreamUtterance,
 )
 from app.config import get_settings
@@ -61,6 +65,7 @@ from app.multimodal.fusion_engine import (
     MultimodalInspectionInput,
     MultimodalInspectionReport,
 )
+from app.simulator import ProductionTrafficSimulator
 
 _LOGGER = logging.getLogger(__name__)
 router = APIRouter()
@@ -107,6 +112,7 @@ class PlatformRuntimeContainer:
         self.rlhf_loop = RLHFAdaptationLoop(self.lora_layer, learning_rate=0.12)
         self.multimodal_engine = MultimodalFusionEngine()
         self.finops_engine = FinOpsROIEngine()
+        self.simulator = ProductionTrafficSimulator(self)
 
     def bootstrap_mlops(self) -> None:
         """Ensure offline Parquet, Feast Online Store, and Production ONNX model exist."""
@@ -406,3 +412,57 @@ async def multimodal_websocket_stream(websocket: WebSocket) -> None:
             )
     except WebSocketDisconnect:
         return
+
+
+@router.post("/api/v1/simulate/start", response_model=SimulationStatusResponse)
+async def start_production_simulation(
+    request: Request,
+    payload: SimulationStartRequest | None = None,
+) -> SimulationStatusResponse:
+    """Start or dynamically update the continuous background production traffic simulator."""
+    container = _get_container(request)
+    cfg = payload if payload is not None else SimulationStartRequest()
+    return await container.simulator.start(
+        interval_seconds=cfg.interval_seconds,
+        drift_wave_every=cfg.drift_wave_every,
+    )
+
+
+@router.post("/api/v1/simulate/stop", response_model=SimulationStatusResponse)
+async def stop_production_simulation(request: Request) -> SimulationStatusResponse:
+    """Gracefully stop the continuous background production traffic simulator."""
+    container = _get_container(request)
+    return await container.simulator.stop()
+
+
+@router.get("/api/v1/simulate/status", response_model=SimulationStatusResponse)
+async def get_production_simulation_status(
+    request: Request,
+    limit_recent: int = Query(default=25, ge=1, le=200),
+) -> SimulationStatusResponse:
+    """Return live simulator running status, aggregated pillar/outcome counts, and recent ticks."""
+    container = _get_container(request)
+    return container.simulator.status(limit_recent=limit_recent)
+
+
+@router.get("/api/v1/simulate/stream")
+async def stream_production_simulation_events(
+    request: Request,
+    max_events: int | None = Query(default=None, ge=1, le=5000),
+) -> StreamingResponse:
+    """Stream live synthetic production events over Server-Sent Events (SSE)."""
+    container = _get_container(request)
+
+    async def _sse_generator() -> AsyncIterator[str]:
+        async for event in container.simulator.stream_events(
+            max_events=max_events,
+            poll_interval=0.04,
+            is_disconnected=request.is_disconnected,
+        ):
+            yield f"data: {event.model_dump_json()}\n\n"
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

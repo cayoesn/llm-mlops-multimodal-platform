@@ -9,7 +9,7 @@ import io
 import logging
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -420,6 +420,7 @@ class ProductionTrafficSimulator:
         *,
         max_events: int | None = None,
         poll_interval: float = 0.05,
+        is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     ) -> AsyncIterator[SimulationEventRecord]:
         """Yield newly generated simulation events as they arrive without busy-spinning."""
         with self._lock:
@@ -428,6 +429,8 @@ class ProductionTrafficSimulator:
         delivered = 0
         sleep_s = max(0.01, poll_interval)
         while max_events is None or delivered < max_events:
+            if is_disconnected is not None and await is_disconnected():
+                return
             with self._lock:
                 fresh = [ev for ev in self._recent_events if ev.tick > cursor]
             if fresh:
