@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -150,3 +150,40 @@ class WebSocketStreamUtterance(BaseModel):
     audio_samples: list[float] = Field(min_length=64, max_length=320_000)
     prompt_hint: str = ""
     frame_base64: str = Field(min_length=8)
+
+
+class SimulationEventRecord(BaseModel):
+    """Immutable telemetry record for a single synthetic production simulation tick."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tick: int
+    timestamp_utc: str
+    pillar: Literal["mlops", "llmops", "multimodal"]
+    scenario: str
+    outcome: str
+    latency_ms: float
+    detail: dict[str, Any]
+
+
+class SimulationStartRequest(BaseModel):
+    """Configuration payload to start or update the continuous production traffic simulator."""
+
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
+
+    interval_seconds: float = Field(default=1.5, ge=0.05, le=60.0)
+    drift_wave_every: int = Field(default=8, ge=1, le=1000)
+
+
+class SimulationStatusResponse(BaseModel):
+    """Live state, aggregated counters, and bounded recent event history of the simulator."""
+
+    model_config = ConfigDict(frozen=True)
+
+    running: bool
+    interval_seconds: float
+    drift_wave_every: int
+    total_ticks: int
+    pillar_counts: dict[str, int]
+    outcome_counts: dict[str, int]
+    recent_events: list[SimulationEventRecord]
