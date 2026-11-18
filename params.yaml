@@ -1,0 +1,12 @@
+dataset:
+  sample_size: 450
+  random_seed: 42
+feast:
+  entity_key: customer_id
+  ttl_seconds: 86400
+training:
+  regularization_c: 1.5
+  max_iter: 300
+evaluation:
+  min_roc_auc: 0.82
+  min_avg_prec: 0.80

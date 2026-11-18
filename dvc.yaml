@@ -1,0 +1,43 @@
+stages:
+  ingest:
+    cmd: python -m app.mlops.dvc_pipeline --stage ingest
+    params:
+      - dataset.sample_size
+      - dataset.random_seed
+    outs:
+      - artifacts/runtime/raw_transactions.parquet
+  validate:
+    cmd: python -m app.mlops.dvc_pipeline --stage validate
+    deps:
+      - artifacts/runtime/raw_transactions.parquet
+    outs:
+      - artifacts/runtime/validation_report.json
+  feast_materialize:
+    cmd: python -m app.mlops.dvc_pipeline --stage feast_materialize
+    deps:
+      - artifacts/runtime/raw_transactions.parquet
+    params:
+      - feast.ttl_seconds
+    outs:
+      - artifacts/runtime/offline_features.parquet
+  train:
+    cmd: python -m app.mlops.dvc_pipeline --stage train
+    deps:
+      - artifacts/runtime/offline_features.parquet
+    params:
+      - training.regularization_c
+      - training.max_iter
+    outs:
+      - artifacts/runtime/risk_model.onnx
+  evaluate:
+    cmd: python -m app.mlops.dvc_pipeline --stage evaluate
+    deps:
+      - artifacts/runtime/risk_model.onnx
+    metrics:
+      - artifacts/runtime/metrics.json
+  register:
+    cmd: python -m app.mlops.dvc_pipeline --stage register
+    deps:
+      - artifacts/runtime/metrics.json
+    params:
+      - evaluation.min_roc_auc

@@ -1,0 +1,10 @@
+name: omnipulse-mlops-pipeline
+
+python_env: python_env.yaml
+
+entry_points:
+  main:
+    parameters:
+      sample_size: {type: int, default: 450}
+      regularization_c: {type: float, default: 1.5}
+    command: "python -m app.mlops.dvc_pipeline"
