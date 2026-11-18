@@ -363,6 +363,9 @@ class MLflowLifecycleManager:
                 for other_v, other_rec in list(self._registry.items()):
                     if other_v != version and other_rec.stage == "Production":
                         self._registry[other_v] = other_rec.model_copy(update={"stage": "Archived"})
+                        self._ort_sessions.pop(other_rec.onnx_artifact_path, None)
+            elif target_stage == "Archived":
+                self._ort_sessions.pop(current.onnx_artifact_path, None)
             updated = current.model_copy(
                 update={
                     "stage": target_stage,

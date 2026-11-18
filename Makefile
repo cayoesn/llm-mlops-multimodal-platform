@@ -18,7 +18,7 @@ lint:
 	.venv/bin/ruff check app tests dags feature_repo && .venv/bin/ruff format --check app tests dags feature_repo
 
 typecheck:
-	.venv/bin/mypy app
+	.venv/bin/mypy app dags feature_repo
 
 pipeline:
 	$(PYTHON) -m app.mlops.dvc_pipeline

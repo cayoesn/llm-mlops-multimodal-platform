@@ -7,13 +7,15 @@ import io
 import json
 import socket
 import time
+from collections.abc import MutableMapping
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import httpx
 import pytest
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from app.api.routes import PlatformRuntimeContainer
@@ -275,3 +277,187 @@ async def test_cli_api_mode_live_tcp_and_websocket_roundtrip(
 
     assert completed == 2
     assert "ws_stream_visual=" in buf.getvalue()
+
+
+async def test_concurrent_stop_and_start_never_orphans_background_task(tmp_path: Path) -> None:
+    """Regression C1: overlapping stop() awaiting slow tick + start() serializes cleanly."""
+    container = PlatformRuntimeContainer()
+    await asyncio.to_thread(container.bootstrap_mlops)
+    sim = ProductionTrafficSimulator(container, max_history=20)
+
+    tick_entered = asyncio.Event()
+    allow_tick_finish = asyncio.Event()
+    orig_predict = container.dvc_runner.feast_service.get_online_features
+
+    def _slow_first_tick(customer_id: str) -> object:
+        if not tick_entered.is_set():
+            tick_entered.set()
+            deadline = time.perf_counter() + 0.15
+            while not allow_tick_finish.is_set() and time.perf_counter() < deadline:
+                time.sleep(0.01)
+        return orig_predict(customer_id)
+
+    with patch.object(
+        container.dvc_runner.feast_service,
+        "get_online_features",
+        side_effect=_slow_first_tick,
+    ):
+        await sim.start(interval_seconds=60.0, drift_wave_every=8)
+        await asyncio.wait_for(tick_entered.wait(), timeout=2.0)
+
+        stop_task = asyncio.create_task(sim.stop())
+        await asyncio.sleep(0.02)
+        start_task = asyncio.create_task(sim.start(interval_seconds=60.0, drift_wave_every=8))
+        allow_tick_finish.set()
+        await asyncio.gather(stop_task, start_task)
+
+    assert sim.status().running is True
+    assert sim.active_task is not None
+    await sim.stop()
+    assert sim.status().running is False
+    assert sim.active_task is None
+    await container.llm_gateway.aclose()
+
+
+async def test_stream_events_exits_cleanly_when_simulator_stopped_and_disconnect_works(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression I3: stream_events returns immediately when stopped; ASGI disconnect works."""
+    monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(tmp_path / "sim_sse_stop"))
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    container = PlatformRuntimeContainer()
+    await asyncio.to_thread(container.bootstrap_mlops)
+
+    async def _collect_stopped() -> list[object]:
+        return [ev async for ev in container.simulator.stream_events(poll_interval=0.01)]
+
+    drained = await asyncio.wait_for(_collect_stopped(), timeout=0.25)
+    assert drained == []
+    await container.llm_gateway.aclose()
+
+    app = create_app()
+    observed_disconnected: list[bool] = []
+
+    @app.get("/_test/check-disconnect")
+    async def _check_disc(request: Request) -> dict[str, bool]:
+        flag = await request.is_disconnected()
+        observed_disconnected.append(flag)
+        return {"disconnected": flag}
+
+    async def _mock_receive() -> MutableMapping[str, Any]:
+        return {"type": "http.disconnect"}
+
+    sent_messages: list[MutableMapping[str, Any]] = []
+
+    async def _mock_send(msg: MutableMapping[str, Any]) -> None:
+        sent_messages.append(msg)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/_test/check-disconnect",
+        "raw_path": b"/_test/check-disconnect",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8017),
+    }
+    await app(scope, _mock_receive, _mock_send)
+    assert observed_disconnected == [True]
+
+
+async def test_api_client_handles_non_json_500_ws_errors_bounded_buffers_and_exc_pii(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression C2, I4, I5: non-JSON 500 resilience, RLHF/ONNX bounds, and log_warning PII."""
+    import logging
+
+    from app.core.observability import log_warning
+    from app.llmops.lora_rlhf_loop import LoRAAdapterLayer, PreferencePair, RLHFAdaptationLoop
+    from app.simulator import _http_to_ws_url
+
+    assert _http_to_ws_url("ws://localhost:8017") == "ws://localhost:8017/ws/v1/multimodal/stream"
+    assert _http_to_ws_url("wss://example.com/") == "wss://example.com/ws/v1/multimodal/stream"
+
+    test_logger = logging.getLogger("omnipulse.test.pii")
+    with caplog.at_level(logging.WARNING, logger="omnipulse.test.pii"):
+        log_warning(
+            test_logger,
+            "warn_with_pii_exception",
+            exc=ValueError("Leaked CPF 123.456.789-01 and mail a.b@omnipulse.ai"),
+        )
+    assert "123.456.789-01" not in caplog.text
+    assert "a.b@omnipulse.ai" not in caplog.text
+
+    layer = LoRAAdapterLayer(d_in=16, d_out=16, rank=2)
+    rlhf = RLHFAdaptationLoop(layer, max_buffer_size=4)
+    pair = PreferencePair(
+        prompt_embedding=[0.1] * 16,
+        chosen_embedding=[0.2] * 16,
+        rejected_embedding=[-0.1] * 16,
+    )
+    for _ in range(10):
+        buf_len = rlhf.record_human_preference(pair)
+    assert buf_len == 4
+
+    def _failing_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="Internal Server Error Plaintext")
+
+    err_buf = io.StringIO()
+    mock_transport = httpx.MockTransport(_failing_handler)
+    async with httpx.AsyncClient(transport=mock_transport, base_url="http://broken") as bad_client:
+        cycles = await run_api_client_simulation(
+            base_url="http://broken",
+            interval_seconds=0.01,
+            drift_wave_every=2,
+            max_cycles=6,
+            http_client=bad_client,
+            enable_websocket=False,
+            output_stream=err_buf,
+        )
+    assert cycles == 6
+    assert "http=500" in err_buf.getvalue()
+    assert "guardrail_blocked" not in err_buf.getvalue()
+
+    container = PlatformRuntimeContainer()
+    await asyncio.to_thread(container.bootstrap_mlops)
+    sim = ProductionTrafficSimulator(container, max_history=25)
+    for _ in range(18):
+        await sim.execute_tick()
+    rag_events = [ev for ev in sim.status().recent_events if ev.scenario == "llmops_rag_chat"]
+    assert len(rag_events) >= 2
+    assert all(ev.detail.get("cache_hit") is False for ev in rag_events)
+    active_paths = {
+        v.onnx_artifact_path
+        for v in container.dvc_runner.mlflow_manager.list_versions()
+        if v.stage != "Archived"
+    }
+    assert set(container.dvc_runner.mlflow_manager._ort_sessions.keys()).issubset(active_paths)
+    await container.llm_gateway.aclose()
+
+    def _net_err_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    net_buf = io.StringIO()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_net_err_handler),
+        base_url="http://127.0.0.1:1",
+    ) as net_client:
+        net_cycles = await run_api_client_simulation(
+            base_url="http://127.0.0.1:1",
+            interval_seconds=0.01,
+            max_cycles=2,
+            http_client=net_client,
+            enable_websocket=True,
+            output_stream=net_buf,
+        )
+    assert net_cycles == 2
+    assert "transport_error=ConnectError" in net_buf.getvalue()
+    assert "ws_stream_error=" in net_buf.getvalue()

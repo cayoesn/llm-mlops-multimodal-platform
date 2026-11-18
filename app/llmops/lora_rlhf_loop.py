@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import threading
 
 import numpy as np
@@ -94,11 +95,19 @@ class LoRAAdapterLayer:
 class RLHFAdaptationLoop:
     """Curates human preference pairs and updates LoRA matrices via Direct Preference margin."""
 
-    def __init__(self, adapter: LoRAAdapterLayer, learning_rate: float = 0.05) -> None:
-        """Bind LoRA adapter and step size."""
+    def __init__(
+        self,
+        adapter: LoRAAdapterLayer,
+        learning_rate: float = 0.05,
+        *,
+        max_buffer_size: int = 128,
+    ) -> None:
+        """Bind LoRA adapter, step size, and bounded RLHF preference ring buffer."""
         self._adapter = adapter
         self._lr = learning_rate
-        self._buffer: list[PreferencePair] = []
+        self._buffer: collections.deque[PreferencePair] = collections.deque(
+            maxlen=max(1, max_buffer_size),
+        )
         self._lock = threading.RLock()
 
     def record_human_preference(self, pair: PreferencePair) -> int:

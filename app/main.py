@@ -60,6 +60,18 @@ class _StreamingBodyLimitMiddleware:
             trace_id=header_map.get("x-trace-id"),
         )
 
+        async def _send_with_correlation(message: MutableMapping[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                hdrs = list(message.get("headers", []))
+                existing = {k.lower() for k, _ in hdrs}
+                if b"x-request-id" not in existing:
+                    hdrs.append((b"x-request-id", req_id.encode("latin-1")))
+                if b"x-process-latency-ms" not in existing:
+                    latency_bytes = f"{get_elapsed_latency_ms():.2f}".encode("latin-1")
+                    hdrs.append((b"x-process-latency-ms", latency_bytes))
+                message = {**message, "headers": hdrs}
+            await send(message)
+
         cl_value = header_map.get("content-length")
         if cl_value is not None:
             try:
@@ -68,17 +80,15 @@ class _StreamingBodyLimitMiddleware:
                 bad_cl = JSONResponse(
                     status_code=400,
                     content={"error": "invalid_content_length"},
-                    headers={"X-Request-ID": req_id},
                 )
-                await bad_cl(scope, receive, send)
+                await bad_cl(scope, receive, _send_with_correlation)
                 return
             if declared_bytes < 0:
                 neg_cl = JSONResponse(
                     status_code=400,
                     content={"error": "negative_content_length"},
-                    headers={"X-Request-ID": req_id},
                 )
-                await neg_cl(scope, receive, send)
+                await neg_cl(scope, receive, _send_with_correlation)
                 return
             if declared_bytes > self._max_bytes:
                 log_warning(
@@ -90,13 +100,12 @@ class _StreamingBodyLimitMiddleware:
                 too_big = JSONResponse(
                     status_code=413,
                     content={"error": "payload_too_large", "max_bytes": self._max_bytes},
-                    headers={"X-Request-ID": req_id},
                 )
-                await too_big(scope, receive, send)
+                await too_big(scope, receive, _send_with_correlation)
                 return
 
         if scope.get("method") not in {"POST", "PUT", "PATCH"}:
-            await self._app(scope, receive, send)
+            await self._app(scope, receive, _send_with_correlation)
             return
 
         buffered_chunks: list[bytes] = []
@@ -119,9 +128,8 @@ class _StreamingBodyLimitMiddleware:
                     too_big_stream = JSONResponse(
                         status_code=413,
                         content={"error": "payload_too_large", "max_bytes": self._max_bytes},
-                        headers={"X-Request-ID": req_id},
                     )
-                    await too_big_stream(scope, receive, send)
+                    await too_big_stream(scope, receive, _send_with_correlation)
                     return
                 buffered_chunks.append(bytes(chunk))
             if not message.get("more_body", False):
@@ -137,7 +145,7 @@ class _StreamingBodyLimitMiddleware:
                 return {"type": "http.request", "body": full_body, "more_body": False}
             return await receive()
 
-        await self._app(scope, _replay_receive, send)
+        await self._app(scope, _replay_receive, _send_with_correlation)
 
 
 def create_app(*, max_request_body_bytes: int = 4_194_304) -> FastAPI:
@@ -163,20 +171,6 @@ def create_app(*, max_request_body_bytes: int = 4_194_304) -> FastAPI:
         ),
         lifespan=lifespan,
     )
-
-    @application.middleware("http")
-    async def correlation_headers_middleware(
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
-        req_id = bind_request_context(
-            request_id=request.headers.get("X-Request-ID"),
-            trace_id=request.headers.get("X-Trace-ID"),
-        )
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = req_id
-        response.headers["X-Process-Latency-Ms"] = f"{get_elapsed_latency_ms():.2f}"
-        return response
 
     application.add_middleware(_StreamingBodyLimitMiddleware, max_bytes=max_request_body_bytes)
 

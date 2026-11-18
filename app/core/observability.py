@@ -80,9 +80,11 @@ def scrub_pii_text(raw: str) -> str:
 
 
 def _sanitize_value(value: Any) -> Any:
-    """Recursively sanitize strings inside structured log fields."""
+    """Recursively sanitize strings and exceptions inside structured log fields."""
     if isinstance(value, str):
         return scrub_pii_text(value)
+    if isinstance(value, BaseException):
+        return scrub_pii_text(str(value))
     if isinstance(value, dict):
         return {str(k): _sanitize_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

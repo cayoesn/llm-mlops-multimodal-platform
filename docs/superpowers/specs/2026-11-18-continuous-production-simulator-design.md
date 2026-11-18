@@ -24,6 +24,6 @@ Permitir observar a plataforma OmniPulse AI operando fim a fim como um ambiente 
 
 ## 6. Padrões Definidos pelo Construtor (Defaults Ajustáveis)
 - **Estado inicial:** Desligado por padrão no boot (`running=False`), iniciando apenas via `POST /api/v1/simulate/start` ou CLI.
-- **Cadência e ondas de anomalia:** Intervalo padrão de `1.5s` por ciclo (`0.1s` a `60.0s`), disparando uma onda sintética de *Data Drift* (`PSI > 0.20` -> retreino automático MLflow) a cada `8` ciclos (`drift_wave_every=8`).
+- **Cadência e ondas de anomalia:** Intervalo padrão de `1.5s` por ciclo (`0.05s` a `60.0s`), disparando uma onda sintética de *Data Drift* (`PSI > 0.20` -> retreino automático MLflow) a cada `8` ciclos (`drift_wave_every=8`).
 - **Memória e ciclo de vida:** Buffer circular `collections.deque(maxlen=200)` para os últimos eventos, contadores agregados por pilar/status protegidos e cancelamento gracioso garantido tanto em `POST /api/v1/simulate/stop` quanto no encerramento do `lifespan` em `app/main.py`.
 - **Modos do CLI (`Makefile`):** `make simulate` (executa e exibe o fluxo contínuo formatado no terminal) e `make simulate-api` (cliente externo exercitando REST + WebSocket `/ws/v1/multimodal/stream` em `http://localhost:8017`).

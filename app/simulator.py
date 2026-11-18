@@ -8,6 +8,7 @@ import base64
 import collections
 import functools
 import io
+import itertools
 import json
 import logging
 import sys
@@ -15,12 +16,14 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
-from typing import Any, Literal, TextIO
+from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 import httpx
 import numpy as np
 from PIL import Image
+from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import WebSocketException
 
 from app.api.schemas import SimulationEventRecord, SimulationStatusResponse
 from app.core.exceptions import GuardrailViolationError
@@ -29,6 +32,9 @@ from app.llmops.lora_rlhf_loop import PreferencePair
 from app.llmops.semantic_cache import embed_text_simd
 from app.multimodal.audio_pipeline import issue_voice_consent_token
 from app.multimodal.fusion_engine import MultimodalInspectionInput
+
+if TYPE_CHECKING:
+    from app.api.routes import PlatformRuntimeContainer
 
 _LOGGER = logging.getLogger("omnipulse.simulator")
 
@@ -57,6 +63,12 @@ _SCENARIO_PILLAR_MAP: dict[str, Literal["mlops", "llmops", "multimodal"]] = {
 
 _CACHE_SEED_QUERY = "Customer asks about damaged parcel instant refund policy within 24 hours"
 
+_RAG_TOPIC_QUERIES: tuple[str, ...] = (
+    "Explain crushed box broken glass screen instant refund SLA timeline",
+    "Detail LGPD cryptographic anonymization rules for voiceprints and payment cards",
+    "When spoken claims contradict intact parcel video how does manual fraud escalation work",
+)
+
 
 @functools.lru_cache(maxsize=4)
 def build_synthetic_png_bytes(*, damaged: bool) -> bytes:
@@ -72,6 +84,12 @@ def build_synthetic_png_bytes(*, damaged: bool) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
     return buf.getvalue()
+
+
+@functools.lru_cache(maxsize=4)
+def _cached_b64_png(*, damaged: bool) -> str:
+    """Return base64-encoded PNG string for HTTP and WebSocket simulator payloads."""
+    return base64.b64encode(build_synthetic_png_bytes(damaged=damaged)).decode("ascii")
 
 
 @functools.lru_cache(maxsize=4)
@@ -109,14 +127,23 @@ def build_synthetic_speech_waveform(sample_count: int = 3200) -> np.ndarray:
     return np.frombuffer(_cached_speech_bytes(sample_count), dtype=np.float32).copy()
 
 
+@functools.lru_cache(maxsize=2)
+def _cached_speech_samples_tuple(sample_count: int = 3200) -> tuple[float, ...]:
+    """Return pre-rounded immutable float tuple for zero-churn JSON serialization."""
+    waveform = np.frombuffer(_cached_speech_bytes(sample_count), dtype=np.float32)
+    return tuple(round(float(x), 5) for x in waveform)
+
+
 class ProductionTrafficSimulator:
     """Non-blocking background workload generator across MLOps, LLMOps, and Multimodal pillars."""
 
-    def __init__(self, container: Any, *, max_history: int = 200) -> None:
-        """Initialize bounded telemetry ring buffer and unified synchronization lock."""
+    def __init__(self, container: PlatformRuntimeContainer, *, max_history: int = 200) -> None:
+        """Initialize bounded telemetry ring buffer and unified synchronization primitives."""
         self._container = container
         self._max_history = max(1, max_history)
         self._lock = threading.RLock()
+        self._lifecycle_lock: asyncio.Lock | None = None
+        self._lifecycle_loop: asyncio.AbstractEventLoop | None = None
         self._running = False
         self._interval_seconds = 1.5
         self._drift_wave_every = 8
@@ -129,6 +156,15 @@ class ProductionTrafficSimulator:
         )
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+
+    def _get_lifecycle_lock(self) -> asyncio.Lock:
+        """Bind or re-bind the async lifecycle mutex to the active running event loop."""
+        running_loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._lifecycle_lock is None or self._lifecycle_loop is not running_loop:
+                self._lifecycle_lock = asyncio.Lock()
+                self._lifecycle_loop = running_loop
+            return self._lifecycle_lock
 
     @property
     def active_task(self) -> asyncio.Task[None] | None:
@@ -202,8 +238,9 @@ class ProductionTrafficSimulator:
             }
 
         if scenario == "llmops_rag_chat":
+            topic_q = _RAG_TOPIC_QUERIES[(tick // 9) % len(_RAG_TOPIC_QUERIES)]
             resp = await self._container.llm_gateway.chat(
-                query=_CACHE_SEED_QUERY,
+                query=f"{topic_q} [audit-batch-{tick * 997}]",
                 tenant_id="sim-enterprise",
             )
             return "grounded", {
@@ -351,7 +388,8 @@ class ProductionTrafficSimulator:
                     continue
         finally:
             with self._lock:
-                self._running = False
+                if self._stop_event is stop_event:
+                    self._running = False
 
     async def start(
         self,
@@ -362,55 +400,61 @@ class ProductionTrafficSimulator:
         """Start background simulation task or dynamically update cadence if already running."""
         clamped_interval = max(0.05, min(60.0, float(interval_seconds)))
         clamped_drift = max(1, min(1000, int(drift_wave_every)))
-        with self._lock:
-            self._interval_seconds = clamped_interval
-            self._drift_wave_every = clamped_drift
-            if self._running and self._task is not None and not self._task.done():
-                log_info(
-                    _LOGGER,
-                    "simulator_cadence_updated",
-                    interval_seconds=clamped_interval,
-                    drift_wave_every=clamped_drift,
+        async with self._get_lifecycle_lock():
+            with self._lock:
+                self._interval_seconds = clamped_interval
+                self._drift_wave_every = clamped_drift
+                if self._running and self._task is not None and not self._task.done():
+                    log_info(
+                        _LOGGER,
+                        "simulator_cadence_updated",
+                        interval_seconds=clamped_interval,
+                        drift_wave_every=clamped_drift,
+                    )
+                    return self.status()
+                stop_event = asyncio.Event()
+                self._stop_event = stop_event
+                self._running = True
+                self._task = asyncio.create_task(
+                    self._loop_worker(stop_event),
+                    name="omnipulse-production-simulator",
                 )
-                return self.status()
-            stop_event = asyncio.Event()
-            self._stop_event = stop_event
-            self._running = True
-            self._task = asyncio.create_task(
-                self._loop_worker(stop_event),
-                name="omnipulse-production-simulator",
-            )
 
-        log_info(
-            _LOGGER,
-            "simulator_started",
-            interval_seconds=clamped_interval,
-            drift_wave_every=clamped_drift,
-        )
-        return self.status()
+            log_info(
+                _LOGGER,
+                "simulator_started",
+                interval_seconds=clamped_interval,
+                drift_wave_every=clamped_drift,
+            )
+            return self.status()
 
     async def stop(self) -> SimulationStatusResponse:
         """Signal stop_event and await clean termination of the background simulation task."""
-        with self._lock:
-            stop_event = self._stop_event
-            task = self._task
-            self._running = False
-            self._stop_event = None
-            self._task = None
+        async with self._get_lifecycle_lock():
+            with self._lock:
+                stop_event = self._stop_event
+                task = self._task
 
-        if stop_event is not None:
-            stop_event.set()
-        if task is not None and not task.done():
-            await task
+            if stop_event is not None:
+                stop_event.set()
+            if task is not None and not task.done():
+                await task
 
-        log_info(_LOGGER, "simulator_stopped", total_ticks=self._tick_counter)
-        return self.status()
+            with self._lock:
+                self._running = False
+                self._stop_event = None
+                self._task = None
+                total_ticks = self._tick_counter
+
+            log_info(_LOGGER, "simulator_stopped", total_ticks=total_ticks)
+            return self.status()
 
     def status(self, *, limit_recent: int = 25) -> SimulationStatusResponse:
         """Return thread-safe snapshot of simulator state, counters, and bounded recent events."""
         cap = max(1, min(self._max_history, limit_recent))
         with self._lock:
-            events = list(self._recent_events)[-cap:]
+            tail_rev = list(itertools.islice(reversed(self._recent_events), cap))
+            tail_rev.reverse()
             return SimulationStatusResponse(
                 running=self._running,
                 interval_seconds=self._interval_seconds,
@@ -418,19 +462,23 @@ class ProductionTrafficSimulator:
                 total_ticks=self._tick_counter,
                 pillar_counts=dict(self._pillar_counts),
                 outcome_counts=dict(self._outcome_counts),
-                recent_events=events,
+                recent_events=tail_rev,
             )
 
     async def stream_events(
         self,
         *,
         max_events: int | None = None,
+        after_tick: int | None = None,
         poll_interval: float = 0.05,
         is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     ) -> AsyncIterator[SimulationEventRecord]:
-        """Yield newly generated simulation events as they arrive without busy-spinning."""
+        """Yield newly generated simulation events in O(delta) and exit cleanly when stopped."""
         with self._lock:
-            cursor = self._recent_events[-1].tick if self._recent_events else self._tick_counter
+            if after_tick is not None:
+                cursor = after_tick
+            else:
+                cursor = self._recent_events[-1].tick if self._recent_events else self._tick_counter
 
         delivered = 0
         sleep_s = max(0.01, poll_interval)
@@ -438,7 +486,14 @@ class ProductionTrafficSimulator:
             if is_disconnected is not None and await is_disconnected():
                 return
             with self._lock:
-                fresh = [ev for ev in self._recent_events if ev.tick > cursor]
+                running = self._running
+                fresh: list[SimulationEventRecord] = []
+                if self._tick_counter > cursor and self._recent_events:
+                    for ev in reversed(self._recent_events):
+                        if ev.tick <= cursor:
+                            break
+                        fresh.append(ev)
+                    fresh.reverse()
             if fresh:
                 for ev in fresh:
                     cursor = ev.tick
@@ -446,14 +501,10 @@ class ProductionTrafficSimulator:
                     yield ev
                     if max_events is not None and delivered >= max_events:
                         return
+            elif not running:
+                return
             else:
                 await asyncio.sleep(sleep_s)
-
-
-@functools.lru_cache(maxsize=4)
-def _cached_b64_png(*, damaged: bool) -> str:
-    """Return base64-encoded PNG string for HTTP and WebSocket simulator payloads."""
-    return base64.b64encode(build_synthetic_png_bytes(damaged=damaged)).decode("ascii")
 
 
 async def run_local_cli_simulation(
@@ -475,7 +526,11 @@ async def run_local_cli_simulation(
             interval_seconds=interval_seconds,
             drift_wave_every=drift_wave_every,
         )
-        async for ev in container.simulator.stream_events(max_events=limit, poll_interval=0.02):
+        async for ev in container.simulator.stream_events(
+            max_events=limit,
+            after_tick=0,
+            poll_interval=0.02,
+        ):
             out.write(
                 f"[tick={ev.tick}] pillar={ev.pillar} scenario={ev.scenario} "
                 f"outcome={ev.outcome} latency_ms={ev.latency_ms} detail={ev.detail}\n"
@@ -488,9 +543,11 @@ async def run_local_cli_simulation(
 
 
 def _http_to_ws_url(base_url: str) -> str:
-    """Convert HTTP(S) base URL to WebSocket endpoint URL for /ws/v1/multimodal/stream."""
+    """Convert HTTP(S) or WS(S) base URL to WebSocket endpoint URL for /ws/v1/multimodal/stream."""
     trimmed = base_url.rstrip("/")
-    if trimmed.startswith("https://"):
+    if trimmed.startswith(("ws://", "wss://")):
+        ws_root = trimmed
+    elif trimmed.startswith("https://"):
         ws_root = "wss://" + trimmed.removeprefix("https://")
     elif trimmed.startswith("http://"):
         ws_root = "ws://" + trimmed.removeprefix("http://")
@@ -499,23 +556,32 @@ def _http_to_ws_url(base_url: str) -> str:
     return f"{ws_root}/ws/v1/multimodal/stream"
 
 
-async def _send_websocket_utterance(base_url: str, cycle: int) -> str:
-    """Send one real-time utterance + frame chunk over WebSocket and return visual label."""
+def _safe_json_dict(resp: httpx.Response) -> dict[str, Any]:
+    """Decode JSON dictionary response safely without raising on plaintext or HTML 5xx bodies."""
+    try:
+        parsed = resp.json()
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def _send_websocket_utterance_on_conn(ws: ClientConnection, cycle: int) -> str:
+    """Send one real-time utterance + frame chunk over an open WebSocket connection."""
     speaker_id = f"ws-sim-{cycle:04d}"
     payload = {
         "utterance_id": f"utt-sim-{cycle:05d}",
         "speaker_id": speaker_id,
         "voice_consent_token": issue_voice_consent_token(speaker_id),
-        "audio_samples": [round(float(x), 5) for x in build_synthetic_speech_waveform()],
+        "audio_samples": list(_cached_speech_samples_tuple()),
         "prompt_hint": "damaged parcel crushed broken glass screen",
         "frame_base64": _cached_b64_png(damaged=(cycle % 2 == 1)),
     }
-    ws_url = _http_to_ws_url(base_url)
-    async with ws_connect(ws_url, open_timeout=5.0, close_timeout=2.0) as ws:
-        await ws.send(json.dumps(payload))
-        raw_reply = await asyncio.wait_for(ws.recv(), timeout=5.0)
+    await ws.send(json.dumps(payload))
+    raw_reply = await asyncio.wait_for(ws.recv(), timeout=5.0)
     parsed = json.loads(raw_reply)
     if isinstance(parsed, dict):
+        if "error" in parsed:
+            return f"error:{parsed['error']}"
         return str(parsed.get("visual_label", "unknown"))
     return "unknown"
 
@@ -531,7 +597,10 @@ async def _execute_api_client_cycle(
             "/api/v1/mlops/predict",
             json={"customer_id": f"cust-{(cycle * 7) % 120:04d}"},
         )
-        return resp.status_code, f"risk_band={resp.json().get('risk_band')}"
+        body = _safe_json_dict(resp)
+        if resp.status_code >= 400:
+            return resp.status_code, f"http_error={body.get('error', resp.status_code)}"
+        return resp.status_code, f"risk_band={body.get('risk_band')}"
 
     if scenario == "mlops_drift_wave":
         rng = np.random.default_rng(2000 + cycle)
@@ -544,26 +613,48 @@ async def _execute_api_client_cycle(
                 "auto_retrain": True,
             },
         )
-        body = resp.json()
+        body = _safe_json_dict(resp)
+        if resp.status_code >= 400:
+            return resp.status_code, f"http_error={body.get('error', resp.status_code)}"
         return resp.status_code, f"retrained={body.get('retraining_triggered')}"
 
     if scenario == "llmops_rag_chat":
         resp = await client.post(
             "/api/v1/llmops/chat",
-            json={"query": _CACHE_SEED_QUERY, "tenant_id": "cli-enterprise"},
+            json={
+                "query": (
+                    f"Dispute review #{cycle}: damaged parcel crushed box broken glass "
+                    "instant refund policy within 24 hours"
+                ),
+                "tenant_id": "cli-enterprise",
+            },
         )
-        return resp.status_code, f"citations={len(resp.json().get('citations', []))}"
+        body = _safe_json_dict(resp)
+        if resp.status_code >= 400:
+            return resp.status_code, f"http_error={body.get('error', resp.status_code)}"
+        citations = body.get("citations")
+        count = len(citations) if isinstance(citations, list) else 0
+        return resp.status_code, f"citations={count}"
 
     if scenario == "llmops_semantic_cache_hit":
-        await client.post(
+        seed_resp = await client.post(
             "/api/v1/llmops/chat",
             json={"query": _CACHE_SEED_QUERY, "tenant_id": "cli-cache"},
         )
+        if seed_resp.status_code >= 400:
+            seed_body = _safe_json_dict(seed_resp)
+            return (
+                seed_resp.status_code,
+                f"http_error={seed_body.get('error', seed_resp.status_code)}",
+            )
         resp = await client.post(
             "/api/v1/llmops/chat",
             json={"query": _CACHE_SEED_QUERY, "tenant_id": "cli-cache"},
         )
-        return resp.status_code, f"cache_hit={resp.json().get('cache_hit')}"
+        body = _safe_json_dict(resp)
+        if resp.status_code >= 400:
+            return resp.status_code, f"http_error={body.get('error', resp.status_code)}"
+        return resp.status_code, f"cache_hit={body.get('cache_hit')}"
 
     if scenario == "llmops_pii_redacted_chat":
         resp = await client.post(
@@ -576,7 +667,10 @@ async def _execute_api_client_cycle(
                 "tenant_id": "cli-lgpd",
             },
         )
-        return resp.status_code, f"pii_redacted={resp.json().get('pii_entities_redacted')}"
+        body = _safe_json_dict(resp)
+        if resp.status_code >= 400:
+            return resp.status_code, f"http_error={body.get('error', resp.status_code)}"
+        return resp.status_code, f"pii_redacted={body.get('pii_entities_redacted')}"
 
     if scenario == "llmops_prompt_injection_blocked":
         resp = await client.post(
@@ -586,7 +680,10 @@ async def _execute_api_client_cycle(
                 "tenant_id": "cli-adversarial",
             },
         )
-        return resp.status_code, "guardrail_blocked"
+        body = _safe_json_dict(resp)
+        if resp.status_code == 400:
+            return resp.status_code, "guardrail_blocked"
+        return resp.status_code, f"http_error={body.get('error', resp.status_code)}"
 
     if scenario == "llmops_lora_rlhf_step":
         resp = await client.post(
@@ -598,7 +695,10 @@ async def _execute_api_client_cycle(
                 "epochs": 4,
             },
         )
-        return resp.status_code, f"post_margin={resp.json().get('post_margin')}"
+        body = _safe_json_dict(resp)
+        if resp.status_code >= 400:
+            return resp.status_code, f"http_error={body.get('error', resp.status_code)}"
+        return resp.status_code, f"post_margin={body.get('post_margin')}"
 
     damaged = scenario == "multimodal_consistent_damage"
     speaker_id = f"cli-speaker-{cycle:04d}"
@@ -612,13 +712,15 @@ async def _execute_api_client_cycle(
             "speaker_id": speaker_id,
             "voice_consent_token": issue_voice_consent_token(speaker_id),
             "claim_text": "Damaged parcel arrived crushed with broken glass screen and impact.",
-            "audio_samples": [round(float(x), 5) for x in build_synthetic_speech_waveform()],
+            "audio_samples": list(_cached_speech_samples_tuple()),
             "audio_prompt_hint": "damaged parcel crushed broken glass screen structural impact",
             "image_base64": img_b64,
             "video_frames_base64": frames,
         },
     )
-    body = resp.json()
+    body = _safe_json_dict(resp)
+    if resp.status_code >= 400:
+        return resp.status_code, f"http_error={body.get('error', resp.status_code)}"
     return resp.status_code, f"contradiction={body.get('contradiction_alert')}"
 
 
@@ -638,6 +740,8 @@ async def run_api_client_simulation(
     client = (
         httpx.AsyncClient(base_url=base_url, timeout=15.0) if http_client is None else http_client
     )
+    ws_conn: ClientConnection | None = None
+    ws_url = _http_to_ws_url(base_url)
     cycle = 0
     scenario_cursor = 0
     safe_drift = max(1, drift_wave_every)
@@ -651,11 +755,36 @@ async def run_api_client_simulation(
                 scenario = _NORMAL_SCENARIOS[scenario_cursor % len(_NORMAL_SCENARIOS)]
                 scenario_cursor += 1
 
-            status_code, summary_note = await _execute_api_client_cycle(client, cycle, scenario)
+            try:
+                status_code, summary_note = await _execute_api_client_cycle(
+                    client,
+                    cycle,
+                    scenario,
+                )
+            except (httpx.HTTPError, OSError, TimeoutError, ValueError) as exc:
+                log_error(
+                    _LOGGER,
+                    "api_simulator_http_cycle_failed",
+                    exc=exc,
+                    cycle=cycle,
+                    scenario=scenario,
+                )
+                status_code = 0
+                summary_note = f"transport_error={type(exc).__name__}"
+
             ws_note = ""
             if enable_websocket and cycle % 2 == 0:
-                vis_label = await _send_websocket_utterance(base_url, cycle)
-                ws_note = f" ws_stream_visual={vis_label}"
+                try:
+                    if ws_conn is None:
+                        ws_conn = await ws_connect(ws_url, open_timeout=5.0, close_timeout=2.0)
+                    vis_label = await _send_websocket_utterance_on_conn(ws_conn, cycle)
+                    ws_note = f" ws_stream_visual={vis_label}"
+                except (WebSocketException, OSError, TimeoutError, ValueError) as exc:
+                    log_warning(_LOGGER, "api_simulator_ws_cycle_failed", cycle=cycle, exc=exc)
+                    if ws_conn is not None:
+                        await ws_conn.close()
+                        ws_conn = None
+                    ws_note = f" ws_stream_error={type(exc).__name__}"
 
             log_info(
                 _LOGGER,
@@ -672,6 +801,8 @@ async def run_api_client_simulation(
                 await asyncio.sleep(wait_s)
         return cycle
     finally:
+        if ws_conn is not None:
+            await ws_conn.close()
         if owns_client:
             await client.aclose()
 
