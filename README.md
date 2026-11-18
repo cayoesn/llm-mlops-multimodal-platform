@@ -127,6 +127,7 @@ $$S_{\text{mm}} = \frac{2}{M(M - 1)} \sum_{1 \le i < j \le M} \max\!\left(0,\, z
 | **Hybrid RRF Vector RAG** | `app/llmops/rag_engine.py` | SIMD dense + lexical fusion + `heapq.nlargest` | $\mathcal{O}(N \cdot D + N \log K)$ | $\mathcal{O}(N \cdot D)$ |
 | **Word Error Rate (WER)** | `app/multimodal/audio_pipeline.py` | Rolling 2-row Wagner-Fischer DP | $\mathcal{O}(M \cdot N)$ | $\mathcal{O}(\min(M, N))$ |
 | **Video Keyframe Extractor** | `app/multimodal/vision_video_pipeline.py` | Vectorized stride + L1 frame-delta spike detector | $\mathcal{O}(F \cdot H \cdot W)$ | $\mathcal{O}(K \cdot H \cdot W)$ |
+| **Production Traffic Simulator** | `app/simulator.py` | Bounded `deque(maxlen=H)` + `RLock` + `asyncio.Event` | $\mathcal{O}(1)$ append / wakeup | $\mathcal{O}(H)$ |
 
 ---
 
@@ -172,6 +173,27 @@ kubectl create namespace mlops-prod
 kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/hpa.yaml -f k8s/vpa.yaml
 ```
 
+### 4. Continuous Synthetic Production Traffic Simulator
+
+Run realistic synthetic production traffic continuously across all 3 pillars (Feast + ONNX scoring, periodic PSI Data Drift waves with auto-retraining, RAG + SIMD Cache + LGPD PII redaction + Guardrail prompt-injection blocks + LoRA DPO steps, and consistent vs. contradictory Audio/Image/Video inspections) to observe live JSON logs, Prometheus `/metrics`, Grafana dashboards, and the HMAC-SHA256 audit chain:
+
+```bash
+# Option A — Self-contained live terminal stream (in-process engine)
+make simulate
+
+# Option B — External HTTP + WebSocket load client against a running server (port 8017)
+make simulate-api
+
+# Option C — Control the background loop inside FastAPI / Docker Compose via REST + SSE
+curl -X POST http://localhost:8017/api/v1/simulate/start \
+  -H "Content-Type: application/json" \
+  -d '{"interval_seconds": 1.0, "drift_wave_every": 8}'
+
+curl -N http://localhost:8017/api/v1/simulate/stream
+curl http://localhost:8017/api/v1/simulate/status
+curl -X POST http://localhost:8017/api/v1/simulate/stop
+```
+
 ---
 
 ## 🔌 API Reference Summary
@@ -188,6 +210,8 @@ kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/hpa.yaml -f k8s/
 | `GET /api/v1/observability/summary` | **3D Obs** | Infrastructure, Holt throughput/drift forecasts, and statistical/semantic quality telemetry |
 | `GET /api/v1/finops/roi` | **FinOps** | Quantifies INT4 + Semantic Cache + HPA + Parquet savings and flags Negative ROI risk |
 | `GET /api/v1/audit/verify` | **Security** | Verifies canonical HMAC-SHA256 cryptographic audit chain integrity in $\mathcal{O}(M)$ |
+| `POST /api/v1/simulate/{start,stop}` | **Simulator** | Starts, updates cadence, or stops the non-blocking continuous 3-pillar production loop |
+| `GET /api/v1/simulate/{status,stream}` | **Simulator** | Returns bounded $\mathcal{O}(1)$ simulator counters or streams live ticks over SSE (`text/event-stream`) |
 | `GET /metrics` & `GET /health` | **Ops** | OpenMetrics Prometheus scrape endpoint & Kubernetes readiness/liveness probe |
 
 ---

@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import socket
 import time
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
+import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.routes import PlatformRuntimeContainer
 from app.main import create_app
-from app.simulator import ProductionTrafficSimulator
+from app.simulator import (
+    ProductionTrafficSimulator,
+    main,
+    run_api_client_simulation,
+    run_local_cli_simulation,
+)
 
 
 async def test_simulator_executes_all_pillars_drift_wave_and_caps_history(tmp_path: Path) -> None:
@@ -177,3 +186,92 @@ def test_simulate_lifespan_shutdown_stops_active_background_task(
     shutdown_elapsed = time.perf_counter() - t_exit
     assert shutdown_elapsed < 0.5
     assert app.state.container.simulator.status().running is False
+
+
+async def test_cli_local_and_asgi_api_modes_execute_bounded_cycles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify run_local_cli_simulation, run_api_client_simulation, and CLI main() entrypoint."""
+    monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(tmp_path / "sim_cli"))
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    local_buf = io.StringIO()
+    local_summary = await run_local_cli_simulation(
+        interval_seconds=0.05,
+        drift_wave_every=2,
+        max_cycles=3,
+        output_stream=local_buf,
+    )
+    assert local_summary.total_ticks == 3
+    assert "tick=1" in local_buf.getvalue()
+
+    app = create_app(max_request_body_bytes=512_000)
+    assert isinstance(app, FastAPI)
+    container = PlatformRuntimeContainer()
+    await asyncio.to_thread(container.bootstrap_mlops)
+    app.state.container = container
+
+    api_buf = io.StringIO()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        completed = await run_api_client_simulation(
+            base_url="http://testserver",
+            interval_seconds=0.01,
+            drift_wave_every=8,
+            max_cycles=9,
+            http_client=client,
+            enable_websocket=False,
+            output_stream=api_buf,
+        )
+    await container.llm_gateway.aclose()
+    assert completed == 9
+    out_text = api_buf.getvalue()
+    assert "mlops_drift_wave" in out_text
+    assert "llmops_prompt_injection_blocked" in out_text
+    assert "multimodal_contradiction_fraud" in out_text
+
+    rc = await asyncio.to_thread(
+        main,
+        ["--mode", "local", "--interval", "0.05", "--drift-every", "3", "--max-cycles", "2"],
+    )
+    assert rc == 0
+
+
+async def test_cli_api_mode_live_tcp_and_websocket_roundtrip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify external API simulator exercises real HTTP + WebSocket over ephemeral TCP."""
+    monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(tmp_path / "sim_tcp"))
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = int(sock.getsockname()[1])
+
+    app = create_app(max_request_body_bytes=512_000)
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.02)
+
+    buf = io.StringIO()
+    try:
+        completed = await run_api_client_simulation(
+            base_url=f"http://127.0.0.1:{port}",
+            interval_seconds=0.01,
+            drift_wave_every=4,
+            max_cycles=2,
+            enable_websocket=True,
+            output_stream=buf,
+        )
+    finally:
+        server.should_exit = True
+        await server_task
+
+    assert completed == 2
+    assert "ws_stream_visual=" in buf.getvalue()
