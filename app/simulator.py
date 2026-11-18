@@ -26,6 +26,7 @@ from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import WebSocketException
 
 from app.api.schemas import SimulationEventRecord, SimulationStatusResponse
+from app.config import get_settings
 from app.core.exceptions import GuardrailViolationError
 from app.core.observability import bind_request_context, log_error, log_info, log_warning
 from app.llmops.lora_rlhf_loop import PreferencePair
@@ -137,10 +138,23 @@ def _cached_speech_samples_tuple(sample_count: int = 3200) -> tuple[float, ...]:
 class ProductionTrafficSimulator:
     """Non-blocking background workload generator across MLOps, LLMOps, and Multimodal pillars."""
 
-    def __init__(self, container: PlatformRuntimeContainer, *, max_history: int = 200) -> None:
+    def __init__(
+        self,
+        container: PlatformRuntimeContainer,
+        *,
+        max_history: int = 200,
+        min_retrain_cooldown_seconds: float | None = None,
+    ) -> None:
         """Initialize bounded telemetry ring buffer and unified synchronization primitives."""
+        resolved_cooldown = (
+            min_retrain_cooldown_seconds
+            if min_retrain_cooldown_seconds is not None
+            else get_settings().OMNIPULSE_SIMULATOR_RETRAIN_COOLDOWN_SECONDS
+        )
         self._container = container
         self._max_history = max(1, max_history)
+        self._min_retrain_cooldown_seconds = max(0.0, float(resolved_cooldown))
+        self._last_retrain_mono: float | None = None
         self._lock = threading.RLock()
         self._lifecycle_lock: asyncio.Lock | None = None
         self._lifecycle_loop: asyncio.AbstractEventLoop | None = None
@@ -223,18 +237,39 @@ class ProductionTrafficSimulator:
             rng = np.random.default_rng(1000 + tick)
             ref_dist = rng.normal(0.0, 1.0, size=80).tolist()
             shifted_dist = rng.normal(2.4, 1.15, size=80).tolist()
-            drift_rep = await asyncio.to_thread(
-                self._container.drift_engine.evaluate_and_retrain_if_needed,
-                reference_feature=ref_dist,
-                current_feature=shifted_dist,
-                recent_accuracy=0.73,
-                auto_retrain=True,
-            )
+            with self._lock:
+                now_mono = time.monotonic()
+                prev_mono = self._last_retrain_mono
+                allow_retrain = (
+                    prev_mono is None
+                    or (now_mono - prev_mono) >= self._min_retrain_cooldown_seconds
+                )
+                if allow_retrain:
+                    self._last_retrain_mono = now_mono
+            try:
+                drift_rep = await asyncio.to_thread(
+                    self._container.drift_engine.evaluate_and_retrain_if_needed,
+                    reference_feature=ref_dist,
+                    current_feature=shifted_dist,
+                    recent_accuracy=0.73,
+                    auto_retrain=allow_retrain,
+                )
+            except BaseException:
+                if allow_retrain:
+                    with self._lock:
+                        if self._last_retrain_mono == now_mono:
+                            self._last_retrain_mono = prev_mono
+                raise
+            if allow_retrain and not drift_rep.retraining_triggered:
+                with self._lock:
+                    if self._last_retrain_mono == now_mono:
+                        self._last_retrain_mono = prev_mono
             outcome = "retrained" if drift_rep.retraining_triggered else "drift_checked"
             return outcome, {
                 "psi_score": round(drift_rep.psi_score, 4),
                 "retraining_triggered": drift_rep.retraining_triggered,
                 "promoted_model_version": drift_rep.promoted_model_version,
+                "cooldown_throttled": not allow_retrain,
             }
 
         if scenario == "llmops_rag_chat":

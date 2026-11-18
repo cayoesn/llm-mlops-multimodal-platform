@@ -15,6 +15,10 @@ class GuardrailViolationError(OmniPulseError):
     """Raised when prompt injection, toxicity, or LGPD/GDPR policy checks block a payload."""
 
 
+class AuthorizationError(OmniPulseError):
+    """Raised when an administrative endpoint receives a missing or invalid token."""
+
+
 class FeatureStoreSkewError(OmniPulseError):
     """Raised when Feast entity keys, point-in-time bounds, or schemas violate parity."""
 

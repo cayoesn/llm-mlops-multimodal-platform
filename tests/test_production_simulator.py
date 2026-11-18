@@ -461,3 +461,172 @@ async def test_api_client_handles_non_json_500_ws_errors_bounded_buffers_and_exc
     assert net_cycles == 2
     assert "transport_error=ConnectError" in net_buf.getvalue()
     assert "ws_stream_error=" in net_buf.getvalue()
+
+
+async def test_simulator_admin_token_guard_and_retrain_cooldown_throttle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify X-Simulator-Token 403 guard and monotonic retrain cooldown anti-amplification."""
+    monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(tmp_path / "sim_guard"))
+    monkeypatch.setenv("OMNIPULSE_SIMULATOR_ADMIN_TOKEN", "omnipulse-sim-admin-secret")
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    app = create_app()
+    with TestClient(app) as client:
+        denied = client.post("/api/v1/simulate/start", json={"interval_seconds": 1.0})
+        assert denied.status_code == 403
+
+        wrong_tok = client.post(
+            "/api/v1/simulate/start",
+            json={"interval_seconds": 1.0},
+            headers={"X-Simulator-Token": "wrong-token"},
+        )
+        assert wrong_tok.status_code == 403
+
+        allowed = client.post(
+            "/api/v1/simulate/start",
+            json={"interval_seconds": 1.0},
+            headers={"X-Simulator-Token": "omnipulse-sim-admin-secret"},
+        )
+        assert allowed.status_code == 200
+        assert allowed.json()["running"] is True
+
+        stop_denied = client.post("/api/v1/simulate/stop")
+        assert stop_denied.status_code == 403
+
+        stop_ok = client.post(
+            "/api/v1/simulate/stop",
+            headers={"X-Simulator-Token": "omnipulse-sim-admin-secret"},
+        )
+        assert stop_ok.status_code == 200
+        assert stop_ok.json()["running"] is False
+
+    monkeypatch.delenv("OMNIPULSE_SIMULATOR_ADMIN_TOKEN", raising=False)
+    reset_settings_cache()
+
+    container = PlatformRuntimeContainer()
+    await asyncio.to_thread(container.bootstrap_mlops)
+    sim = ProductionTrafficSimulator(
+        container,
+        max_history=10,
+        min_retrain_cooldown_seconds=30.0,
+    )
+    await sim.start(interval_seconds=60.0, drift_wave_every=1)
+    await sim.stop()
+
+    ev1 = await sim.execute_tick()
+    ev2 = await sim.execute_tick()
+    ev3 = await sim.execute_tick()
+    assert ev1.scenario == "mlops_drift_wave"
+    assert ev1.outcome == "retrained"
+    assert ev1.detail.get("cooldown_throttled") is False
+    assert ev2.outcome == "drift_checked"
+    assert ev2.detail.get("cooldown_throttled") is True
+    assert ev3.outcome == "drift_checked"
+    assert ev3.detail.get("cooldown_throttled") is True
+    await container.llm_gateway.aclose()
+
+
+async def test_mlflow_concurrent_predict_and_archive_toctou_and_disk_pruning(
+    tmp_path: Path,
+) -> None:
+    """Verify zero leaked archived ONNX sessions under concurrency and bounded disk pruning."""
+    from app.mlops.mlflow_lifecycle import MLflowLifecycleManager
+
+    art_root = tmp_path / "mlflow_pruning"
+    manager = MLflowLifecycleManager(
+        artifact_root=art_root,
+        max_archived_versions=2,
+        max_tracked_runs=6,
+    )
+    first_run = manager.train_and_track_experiment(run_name="v1", sample_size=120, random_seed=1)
+    v1 = manager.register_model_version(first_run.run_id)
+    manager.transition_model_stage(v1.version, target_stage="Production")
+
+    async def _predict_burst() -> None:
+        for idx in range(30):
+            await asyncio.to_thread(
+                manager.predict_with_ab_routing,
+                customer_id=f"cust-{idx:04d}",
+                feature_vector=[0.4, 0.3, 0.05, 0.85],
+            )
+
+    async def _promote_sequence() -> None:
+        for step in range(2, 7):
+            run = await asyncio.to_thread(
+                manager.train_and_track_experiment,
+                run_name=f"v{step}",
+                sample_size=120,
+                random_seed=step,
+            )
+            reg = await asyncio.to_thread(manager.register_model_version, run.run_id)
+            await asyncio.to_thread(
+                manager.transition_model_stage,
+                reg.version,
+                target_stage="Production",
+            )
+
+    await asyncio.gather(_predict_burst(), _promote_sequence())
+
+    versions = manager.list_versions()
+    archived = [v for v in versions if v.stage == "Archived"]
+    assert len(archived) <= 2
+    non_archived_paths = {v.onnx_artifact_path for v in versions if v.stage != "Archived"}
+    assert set(manager._ort_sessions.keys()).issubset(non_archived_paths)
+    run_dirs_on_disk = list((art_root / "runs").glob("run-*"))
+    assert len(run_dirs_on_disk) <= 3
+
+
+async def test_anchored_audit_chain_bounded_rotation_and_nonblocking_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify O(1) anchored sliding-window audit rotation and off-event-loop telemetry routes."""
+    import dataclasses
+
+    from app.core.observability import CryptographicAuditChain
+
+    chain = CryptographicAuditChain(secret_key="bounded-secret-key-2026", max_records=5)
+    for idx in range(1, 13):
+        chain.append(
+            request_id=f"req-{idx}",
+            pillar="mlops",
+            action="predict",
+            payload_hash=f"sha256:{idx:04d}",
+            confidence=0.9,
+        )
+
+    assert len(chain) == 5
+    retained = chain.records()
+    assert [r.seq for r in retained] == [8, 9, 10, 11, 12]
+    valid, count, detail = chain.verify()
+    assert valid is True
+    assert count == 5
+    assert "anchor_seq=7" in detail
+
+    tampered = dataclasses.replace(retained[2], action="forged_action")
+    chain._records[2] = tampered
+    valid_after, _, _ = chain.verify()
+    assert valid_after is False
+
+    monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(tmp_path / "nonblock_api"))
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    app = create_app()
+    with (
+        patch("app.api.routes.asyncio.to_thread", wraps=asyncio.to_thread) as spy_to_thread,
+        TestClient(app) as client,
+    ):
+        before = spy_to_thread.call_count
+        resp_audit = client.get("/api/v1/audit/verify")
+        resp_obs = client.get("/api/v1/observability/summary")
+        resp_metrics = client.get("/metrics")
+        resp_sim_status = client.get("/api/v1/simulate/status")
+        assert resp_audit.status_code == 200
+        assert resp_obs.status_code == 200
+        assert resp_metrics.status_code == 200
+        assert resp_sim_status.status_code == 200
+        assert spy_to_thread.call_count - before == 4

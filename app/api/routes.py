@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hmac
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -33,6 +34,7 @@ from app.api.schemas import (
 )
 from app.config import get_settings
 from app.core.exceptions import (
+    AuthorizationError,
     GuardrailViolationError,
     ModalitySyncError,
     ValidationLayerError,
@@ -125,6 +127,16 @@ def _get_container(request: Request) -> PlatformRuntimeContainer:
     return container
 
 
+def _verify_simulator_admin_token(request: Request) -> None:
+    """Enforce constant-time X-Simulator-Token check when OMNIPULSE_SIMULATOR_ADMIN_TOKEN is set."""
+    expected = get_settings().OMNIPULSE_SIMULATOR_ADMIN_TOKEN.strip()
+    if not expected:
+        return
+    provided = (request.headers.get("X-Simulator-Token") or "").strip()
+    if not provided or not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+        raise AuthorizationError("Valid X-Simulator-Token header is required.")
+
+
 def _decode_base64_bytes(encoded: str) -> bytes:
     """Decode base64 media string into raw bytes with strict validation."""
     try:
@@ -161,20 +173,20 @@ async def health_check() -> HealthResponse:
 @router.get("/metrics")
 async def prometheus_metrics() -> Response:
     """Expose 3D Prometheus OpenMetrics scrape payload."""
-    text = get_observability_hub().export_prometheus_text()
+    text = await asyncio.to_thread(get_observability_hub().export_prometheus_text)
     return Response(content=text, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @router.get("/api/v1/observability/summary")
 async def observability_summary() -> dict[str, Any]:
     """Return consolidated 3D observability snapshot with Holt linear forecasts."""
-    return get_observability_hub().snapshot_3d()
+    return await asyncio.to_thread(get_observability_hub().snapshot_3d)
 
 
 @router.get("/api/v1/audit/verify", response_model=AuditVerifyResponse)
 async def verify_audit_chain() -> AuditVerifyResponse:
     """Verify full HMAC-SHA256 cryptographic audit chain integrity."""
-    valid, count, detail = get_observability_hub().audit_chain.verify()
+    valid, count, detail = await asyncio.to_thread(get_observability_hub().audit_chain.verify)
     return AuditVerifyResponse(valid=valid, records=count, detail=detail)
 
 
@@ -420,6 +432,7 @@ async def start_production_simulation(
     payload: SimulationStartRequest | None = None,
 ) -> SimulationStatusResponse:
     """Start or dynamically update the continuous background production traffic simulator."""
+    _verify_simulator_admin_token(request)
     container = _get_container(request)
     cfg = payload if payload is not None else SimulationStartRequest()
     return await container.simulator.start(
@@ -431,6 +444,7 @@ async def start_production_simulation(
 @router.post("/api/v1/simulate/stop", response_model=SimulationStatusResponse)
 async def stop_production_simulation(request: Request) -> SimulationStatusResponse:
     """Gracefully stop the continuous background production traffic simulator."""
+    _verify_simulator_admin_token(request)
     container = _get_container(request)
     return await container.simulator.stop()
 
@@ -442,7 +456,7 @@ async def get_production_simulation_status(
 ) -> SimulationStatusResponse:
     """Return live simulator running status, aggregated pillar/outcome counts, and recent ticks."""
     container = _get_container(request)
-    return container.simulator.status(limit_recent=limit_recent)
+    return await asyncio.to_thread(container.simulator.status, limit_recent=limit_recent)
 
 
 @router.get("/api/v1/simulate/stream")

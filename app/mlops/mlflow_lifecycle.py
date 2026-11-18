@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
 import threading
 import time
 import uuid
@@ -154,8 +155,11 @@ class MLflowLifecycleManager:
         self,
         artifact_root: Path | None = None,
         mlproject_path: Path | None = None,
+        *,
+        max_archived_versions: int | None = None,
+        max_tracked_runs: int = 32,
     ) -> None:
-        """Initialize artifact root, MLproject file path, and ONNX session cache."""
+        """Initialize artifact root, MLproject file path, retention caps, and ONNX cache."""
         settings = get_settings()
         base_dir = Path(settings.OMNIPULSE_ARTIFACT_DIR)
         self._artifact_root = (
@@ -166,6 +170,13 @@ class MLflowLifecycleManager:
             if mlproject_path is not None
             else Path(__file__).resolve().parents[2] / "MLproject"
         )
+        resolved_archived = (
+            max_archived_versions
+            if max_archived_versions is not None
+            else settings.OMNIPULSE_MLFLOW_MAX_ARCHIVED_VERSIONS
+        )
+        self._max_archived_versions = max(1, int(resolved_archived))
+        self._max_tracked_runs = max(4, int(max_tracked_runs))
         self._min_roc_auc = settings.OMNIPULSE_MIN_CHAMPION_ROC_AUC
         self._challenger_ratio = settings.OMNIPULSE_AB_CHALLENGER_TRAFFIC_RATIO
         self._lock = threading.RLock()
@@ -173,6 +184,32 @@ class MLflowLifecycleManager:
         self._registry: dict[int, RegisteredModelVersion] = {}
         self._ort_sessions: dict[str, ort.InferenceSession] = {}
         self._rehydrate_from_disk()
+
+    def _remove_run_artifacts_locked(self, run_id: str, onnx_path: str) -> None:
+        """Evict ONNX session, run metadata, and on-disk run directory for an unreferenced run."""
+        self._ort_sessions.pop(onnx_path, None)
+        self._runs.pop(run_id, None)
+        run_dir = self._artifact_root / "runs" / run_id
+        if run_dir.exists():
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def _prune_excess_archived_locked(self) -> None:
+        """Bound Archived registry entries, orphan runs, and on-disk ONNX artifact directories."""
+        archived_versions = [v for _, v in sorted(self._registry.items()) if v.stage == "Archived"]
+        while len(archived_versions) > self._max_archived_versions:
+            oldest = archived_versions.pop(0)
+            self._registry.pop(oldest.version, None)
+            self._ort_sessions.pop(oldest.onnx_artifact_path, None)
+            still_referenced = any(r.run_id == oldest.run_id for r in self._registry.values())
+            if not still_referenced:
+                self._remove_run_artifacts_locked(oldest.run_id, oldest.onnx_artifact_path)
+
+        referenced_run_ids = {r.run_id for r in self._registry.values()}
+        orphan_runs = [r for r in self._runs.values() if r.run_id not in referenced_run_ids]
+        orphan_runs.sort(key=lambda item: item.timestamp_utc)
+        while len(self._runs) > self._max_tracked_runs and orphan_runs:
+            stale = orphan_runs.pop(0)
+            self._remove_run_artifacts_locked(stale.run_id, stale.onnx_artifact_path)
 
     def _registry_index_path(self) -> Path:
         """Return path to the persisted JSON model registry index."""
@@ -309,6 +346,7 @@ class MLflowLifecycleManager:
         with self._lock:
             self._runs[run_id] = run_record
             self._ort_sessions[str(onnx_path)] = session
+            self._prune_excess_archived_locked()
 
         hub = get_observability_hub()
         hub.record_model_quality(pillar="mlops", metric_name="roc_auc", value=metrics.roc_auc)
@@ -328,7 +366,7 @@ class MLflowLifecycleManager:
             run = self._runs.get(run_id)
             if run is None:
                 raise ValidationLayerError(f"Unknown MLflow run_id '{run_id}'.")
-            version_num = len(self._registry) + 1
+            version_num = (max(self._registry) + 1) if self._registry else 1
             registered = RegisteredModelVersion(
                 model_name=self.MODEL_NAME,
                 version=version_num,
@@ -373,6 +411,7 @@ class MLflowLifecycleManager:
                 }
             )
             self._registry[version] = updated
+            self._prune_excess_archived_locked()
             self._persist_registry_locked()
         log_event(
             _LOGGER,
@@ -414,22 +453,21 @@ class MLflowLifecycleManager:
         with self._lock:
             prod_candidates = [v for v in self._registry.values() if v.stage == "Production"]
             staging_candidates = [v for v in self._registry.values() if v.stage == "Staging"]
+            if not prod_candidates:
+                raise ModelRegistryStageError("No Production model registered in MLflow Registry.")
+            champion = prod_candidates[-1]
+            selected = champion
 
-        if not prod_candidates:
-            raise ModelRegistryStageError("No Production model registered in MLflow Registry.")
-        champion = prod_candidates[-1]
-        selected = champion
+            if staging_candidates:
+                digest_val = int.from_bytes(
+                    hashlib.sha256(customer_id.encode("utf-8")).digest()[:4],
+                    byteorder="big",
+                )
+                bucket = (digest_val % 10_000) / 10_000.0
+                if bucket < self._challenger_ratio:
+                    selected = staging_candidates[-1]
 
-        if staging_candidates:
-            digest_val = int.from_bytes(
-                hashlib.sha256(customer_id.encode("utf-8")).digest()[:4],
-                byteorder="big",
-            )
-            bucket = (digest_val % 10_000) / 10_000.0
-            if bucket < self._challenger_ratio:
-                selected = staging_candidates[-1]
-
-        session = self._get_session(selected.onnx_artifact_path)
+            session = self._get_session(selected.onnx_artifact_path)
         prob = float(session.run(None, {"features": arr})[0][0, 0])
         band: Literal["LOW", "MEDIUM", "HIGH"] = (
             "HIGH" if prob >= 0.70 else ("MEDIUM" if prob >= 0.35 else "LOW")

@@ -196,20 +196,31 @@ class AuditChainRecord:
 
 
 class CryptographicAuditChain:
-    """Collision-free canonical JSON HMAC-SHA256 audit chain with O(1) append and O(M) verify."""
+    """Bounded anchored canonical JSON HMAC-SHA256 audit chain with O(1) append and O(W) verify."""
 
     GENESIS_DIGEST = "0" * 64
 
-    def __init__(self, secret_key: str | None = None) -> None:
-        """Initialize the audit chain with an HMAC secret of at least 8 characters."""
-        raw_secret = (
-            secret_key if secret_key is not None else get_settings().OMNIPULSE_AUDIT_HMAC_SECRET
-        )
+    def __init__(
+        self,
+        secret_key: str | None = None,
+        *,
+        max_records: int | None = None,
+    ) -> None:
+        """Initialize the audit chain with an HMAC secret and sliding-window anchor cap."""
+        settings = get_settings()
+        raw_secret = secret_key if secret_key is not None else settings.OMNIPULSE_AUDIT_HMAC_SECRET
         if len(raw_secret.strip()) < 8:
             raise ValueError("HMAC secret_key must be at least 8 characters long.")
+        resolved_max = (
+            max_records if max_records is not None else settings.OMNIPULSE_MAX_AUDIT_RECORDS
+        )
+        self._max_records = max(2, int(resolved_max))
         self._secret_bytes = raw_secret.encode("utf-8")
         self._lock = threading.RLock()
-        self._records: list[AuditChainRecord] = []
+        self._records: collections.deque[AuditChainRecord] = collections.deque()
+        self._anchor_seq = 0
+        self._anchor_digest = self.GENESIS_DIGEST
+        self._next_seq = 1
 
     def __len__(self) -> int:
         """Return total number of audit records."""
@@ -263,8 +274,8 @@ class CryptographicAuditChain:
         if isinstance(confidence, bool) or not math.isfinite(confidence):
             raise ValueError("Audit confidence must be a finite float.")
         with self._lock:
-            seq = len(self._records) + 1
-            prev_hash = self._records[-1].signature if self._records else self.GENESIS_DIGEST
+            seq = self._next_seq
+            prev_hash = self._records[-1].signature if self._records else self._anchor_digest
             ts = datetime.now(UTC).isoformat()
             mac = self._compute_canonical_mac(
                 seq=seq,
@@ -287,19 +298,33 @@ class CryptographicAuditChain:
                 previous_hash=prev_hash,
                 signature=mac,
             )
+            if len(self._records) >= self._max_records:
+                evicted = self._records.popleft()
+                self._anchor_seq = evicted.seq
+                self._anchor_digest = evicted.signature
             self._records.append(record)
+            self._next_seq += 1
             return record
 
     def verify(self) -> tuple[bool, int, str]:
-        """Verify strict sequence monotonicity, hash linkage, and HMAC signatures in O(M)."""
+        """Verify strict sequence monotonicity, anchor linkage, and HMAC signatures in O(W)."""
         with self._lock:
             snapshot = list(self._records)
-        expected_prev = self.GENESIS_DIGEST
-        for idx, rec in enumerate(snapshot, start=1):
-            if rec.seq != idx:
-                return False, idx, f"Sequence discontinuity at index {idx}: got {rec.seq}"
+            anchor_seq = self._anchor_seq
+            expected_prev = self._anchor_digest
+        for offset, rec in enumerate(snapshot, start=1):
+            expected_seq = anchor_seq + offset
+            if rec.seq != expected_seq:
+                return (
+                    False,
+                    offset,
+                    (
+                        f"Sequence discontinuity at offset {offset}: "
+                        f"expected {expected_seq}, got {rec.seq}"
+                    ),
+                )
             if rec.previous_hash != expected_prev:
-                return False, idx, f"Broken previous_hash link at seq {rec.seq}"
+                return False, offset, f"Broken previous_hash link at seq {rec.seq}"
             expected_mac = self._compute_canonical_mac(
                 seq=rec.seq,
                 timestamp_utc=rec.timestamp_utc,
@@ -311,9 +336,13 @@ class CryptographicAuditChain:
                 previous_hash=rec.previous_hash,
             )
             if not hmac.compare_digest(rec.signature, expected_mac):
-                return False, idx, f"Invalid HMAC signature at seq {rec.seq}"
+                return False, offset, f"Invalid HMAC signature at seq {rec.seq}"
             expected_prev = rec.signature
-        return True, len(snapshot), f"Verified {len(snapshot)} canonical HMAC-SHA256 records."
+        return (
+            True,
+            len(snapshot),
+            f"Verified {len(snapshot)} canonical HMAC-SHA256 records (anchor_seq={anchor_seq}).",
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -50,11 +50,18 @@ class Settings(BaseSettings):
     OMNIPULSE_STORAGE_GB_MONTH_USD: float = 0.023
     OMNIPULSE_RETRAIN_RUN_COST_USD: float = 4.50
 
+    OMNIPULSE_SIMULATOR_ADMIN_TOKEN: str = ""
+    OMNIPULSE_SIMULATOR_RETRAIN_COOLDOWN_SECONDS: float = 10.0
+    OMNIPULSE_MAX_AUDIT_RECORDS: int = 2000
+    OMNIPULSE_MLFLOW_MAX_ARCHIVED_VERSIONS: int = 8
+
     @field_validator(
         "OMNIPULSE_API_PORT",
         "OMNIPULSE_SEMANTIC_CACHE_MAX_SIZE",
         "OMNIPULSE_MAX_IMAGE_PIXELS",
         "OMNIPULSE_MAX_IMAGE_SIDE",
+        "OMNIPULSE_MAX_AUDIT_RECORDS",
+        "OMNIPULSE_MLFLOW_MAX_ARCHIVED_VERSIONS",
         mode="before",
     )
     @classmethod
@@ -77,6 +84,7 @@ class Settings(BaseSettings):
         "OMNIPULSE_GPU_HOUR_RATE_USD",
         "OMNIPULSE_STORAGE_GB_MONTH_USD",
         "OMNIPULSE_RETRAIN_RUN_COST_USD",
+        "OMNIPULSE_SIMULATOR_RETRAIN_COOLDOWN_SECONDS",
         mode="before",
     )
     @classmethod

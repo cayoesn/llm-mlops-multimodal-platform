@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +41,7 @@ def _make_speech_samples(count: int = 3200) -> list[float]:
 
 
 @pytest.fixture
-def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     """Instantiate hermetic FastAPI TestClient backed by an isolated workspace directory."""
     monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(tmp_path / "runtime"))
     from app.config import reset_settings_cache
@@ -338,8 +339,6 @@ def test_chunked_streaming_body_limit_video_bomb_guard_and_ws_error_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify chunked 413 enforcement, video frame bomb guard, and WS structured error frames."""
-    from collections.abc import Iterator
-
     from fastapi import FastAPI
 
     def _chunked_payload() -> Iterator[bytes]:

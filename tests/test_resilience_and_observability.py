@@ -99,13 +99,13 @@ async def test_circuit_breaker_records_single_failure_after_retries_and_ignores_
     with pytest.raises(DownstreamHTTPStatusError):
         await executor.execute_async(always_503, total_sla_seconds=1.0)
     assert breaker.consecutive_failures == 2
-    assert breaker.state == "OPEN"
+    assert str(breaker.state) == "OPEN"
 
     with pytest.raises(CircuitBreakerOpenError):
         await executor.execute_async(always_503, total_sla_seconds=1.0)
 
     await asyncio.sleep(0.06)
-    assert breaker.state == "HALF_OPEN"
+    assert str(breaker.state) == "HALF_OPEN"
 
     async def not_found_404() -> str:
         raise DownstreamHTTPStatusError(status_code=404, message="entity missing")

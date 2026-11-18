@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes import PlatformRuntimeContainer, router
 from app.core.exceptions import (
+    AuthorizationError,
     CircuitBreakerOpenError,
     FeatureStoreSkewError,
     GuardrailViolationError,
@@ -180,6 +181,14 @@ def create_app(*, max_request_body_bytes: int = 4_194_304) -> FastAPI:
         return JSONResponse(
             status_code=400,
             content={"error": "guardrail_violation", "detail": str(exc)},
+        )
+
+    @application.exception_handler(AuthorizationError)
+    async def handle_authorization_error(_request: Request, exc: AuthorizationError) -> Response:
+        log_warning(_LOGGER, "authorization_rejected", exc=exc)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "forbidden", "detail": str(exc)},
         )
 
     @application.exception_handler(ValidationLayerError)
