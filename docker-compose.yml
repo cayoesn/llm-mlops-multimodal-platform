@@ -1,0 +1,120 @@
+services:
+  omnipulse-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: omnipulse-api
+    ports:
+      - "8017:8017"
+    environment:
+      OMNIPULSE_ENV: production
+      OMNIPULSE_API_PORT: "8017"
+      OMNIPULSE_MLFLOW_TRACKING_URI: http://mlflow:5000
+      OMNIPULSE_REDIS_URL: redis://redis:6379/0
+      OMNIPULSE_QDRANT_URL: http://qdrant:6333
+      OMNIPULSE_LLM_BACKEND: local_deterministic
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      mlflow:
+        condition: service_started
+    volumes:
+      - omnipulse_runtime:/var/lib/omnipulse/runtime
+    restart: unless-stopped
+    networks:
+      - omnipulse-net
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.17.2
+    container_name: omnipulse-mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+    ports:
+      - "5005:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    restart: unless-stopped
+    networks:
+      - omnipulse-net
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: omnipulse-feast-redis
+    ports:
+      - "6385:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - omnipulse-net
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: omnipulse-qdrant
+    ports:
+      - "6339:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - omnipulse-net
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: omnipulse-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9095:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - omnipulse-api
+    restart: unless-stopped
+    networks:
+      - omnipulse-net
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: omnipulse-grafana
+    ports:
+      - "3009:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: omnipulse-admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - omnipulse-net
+
+volumes:
+  omnipulse_runtime:
+  mlflow_data:
+  redis_data:
+  qdrant_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  omnipulse-net:
+    driver: bridge

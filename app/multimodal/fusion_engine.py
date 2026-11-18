@@ -190,6 +190,16 @@ class MultimodalFusionEngine:
         self._feedback_queue: list[MultimodalFeedbackRecord] = []
         self._lock = threading.RLock()
 
+    @property
+    def audio_pipeline(self) -> AudioMLOpsPipeline:
+        """Return the underlying AudioMLOpsPipeline."""
+        return self._audio
+
+    @property
+    def vision_pipeline(self) -> VisionVideoMLOpsPipeline:
+        """Return the underlying VisionVideoMLOpsPipeline."""
+        return self._vision
+
     async def inspect(self, payload: MultimodalInspectionInput) -> MultimodalInspectionReport:
         """Execute concurrent multimodal encoding, compute synergy matrix, and score RAGAS."""
         started_ns = time.perf_counter_ns()

@@ -1,0 +1,33 @@
+stages:
+  - unit_quality
+  - ml_integration
+  - delivery_and_airflow_dag_sync
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+unit_and_typing_gate:
+  stage: unit_quality
+  image: python:3.12-slim
+  script:
+    - pip install -e ".[dev]"
+    - ruff check app tests dags feature_repo
+    - mypy app dags feature_repo
+    - pytest tests/test_resilience_and_observability.py -v
+
+mlops_llmops_multimodal_gate:
+  stage: ml_integration
+  image: python:3.12-slim
+  script:
+    - pip install -e ".[dev]"
+    - pytest tests -v --cov=app --cov-fail-under=95
+    - python -m app.mlops.dvc_pipeline
+
+deploy_airflow_dags_and_container:
+  stage: delivery_and_airflow_dag_sync
+  image: python:3.12-slim
+  only:
+    - main
+  script:
+    - python -c "from dags.omnipulse_mlops_dag import build_airflow_dag_spec; assert len(build_airflow_dag_spec().tasks) == 5"
+    - echo "Airflow DAG omnipulse_mlops_dag.py verified and ready for scheduler sync."

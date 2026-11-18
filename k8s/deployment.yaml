@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnipulse-platform
+  namespace: mlops-prod
+  labels:
+    app: omnipulse-platform
+    tier: inference-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: omnipulse-platform
+  template:
+    metadata:
+      labels:
+        app: omnipulse-platform
+        tier: inference-gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8017"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: omnipulse-api
+          image: ghcr.io/cayoesn/llm-mlops-multimodal-platform:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8017
+          env:
+            - name: OMNIPULSE_ENV
+              value: "production"
+            - name: OMNIPULSE_REDIS_URL
+              value: "redis://omnipulse-redis.mlops-prod.svc.cluster.local:6379/0"
+            - name: OMNIPULSE_QDRANT_URL
+              value: "http://omnipulse-qdrant.mlops-prod.svc.cluster.local:6333"
+            - name: OMNIPULSE_MLFLOW_TRACKING_URI
+              value: "http://omnipulse-mlflow.mlops-prod.svc.cluster.local:5000"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1536Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20

@@ -13,7 +13,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -464,8 +464,8 @@ class ObservabilityHub:
         return {
             "dimension_1_infrastructure": infra_copy,
             "dimension_2_service_forecast": {
-                "throughput_forecast": self.rps_forecaster.forecast(horizon=5).__dict__,
-                "drift_forecast": self.drift_forecaster.forecast(horizon=5).__dict__,
+                "throughput_forecast": asdict(self.rps_forecaster.forecast(horizon=5)),
+                "drift_forecast": asdict(self.drift_forecaster.forecast(horizon=5)),
             },
             "dimension_3_model_quality": quality_copy,
             "audit_chain": {

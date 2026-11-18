@@ -1,0 +1,24 @@
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: omnipulse-platform-vpa
+  namespace: mlops-prod
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: omnipulse-platform
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: omnipulse-api
+        minAllowed:
+          cpu: "200m"
+          memory: "384Mi"
+        maxAllowed:
+          cpu: "2000m"
+          memory: "3Gi"
+        controlledResources:
+          - cpu
+          - memory

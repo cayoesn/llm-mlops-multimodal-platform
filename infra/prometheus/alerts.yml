@@ -1,0 +1,32 @@
+groups:
+  - name: omnipulse_3d_mlops_llmops_alerts
+    rules:
+      - alert: OmniPulseHighDataDriftPSI
+        expr: omnipulse_model_quality_score{pillar="mlops",metric="psi_data_drift"} >= 0.20
+        for: 1m
+        labels:
+          severity: critical
+          pillar: mlops
+        annotations:
+          summary: "Classical MLOps Population Stability Index breached 0.20 threshold"
+          description: "Automated retraining loop required to mitigate training-serving distribution drift."
+
+      - alert: OmniPulseLowRAGASFaithfulness
+        expr: omnipulse_model_quality_score{pillar="llmops",metric="ragas_faithfulness"} < 0.70
+        for: 2m
+        labels:
+          severity: warning
+          pillar: llmops
+        annotations:
+          summary: "LLMOps RAGAS Faithfulness fell below 0.70 semantic grounding gate"
+          description: "Inspect Qdrant chunk retrieval recall and prompt registry version."
+
+      - alert: OmniPulseMultimodalSynergyCollapse
+        expr: omnipulse_model_quality_score{pillar="multimodal_fusion",metric="cross_modal_synergy"} < 0.50
+        for: 1m
+        labels:
+          severity: critical
+          pillar: multimodal
+        annotations:
+          summary: "Cross-modal contradiction or modality collapse detected across Text/Audio/Vision/Video"
+          description: "Route flagged omnichannel disputes to manual fraud review and multimodal curation."

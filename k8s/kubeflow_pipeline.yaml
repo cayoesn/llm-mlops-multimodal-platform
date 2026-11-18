@@ -1,0 +1,41 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: omnipulse-kubeflow-level2-pipeline-
+  namespace: kubeflow
+  labels:
+    pipelines.kubeflow.org/kfp_sdk_version: 2.9.0
+spec:
+  entrypoint: omnipulse-mlops-dag
+  templates:
+    - name: omnipulse-mlops-dag
+      dag:
+        tasks:
+          - name: dvc-ingest-and-validate
+            template: python-stage
+            arguments:
+              parameters:
+                - name: cmd
+                  value: "python -m app.mlops.dvc_pipeline"
+          - name: feast-pit-and-online-materialize
+            dependencies: [dvc-ingest-and-validate]
+            template: python-stage
+            arguments:
+              parameters:
+                - name: cmd
+                  value: "python -c 'from app.mlops.dvc_pipeline import DVCPipelineRunner; DVCPipelineRunner().feast_service.materialize_to_online_store()'"
+          - name: mlflow-slo-and-drift-gate
+            dependencies: [feast-pit-and-online-materialize]
+            template: python-stage
+            arguments:
+              parameters:
+                - name: cmd
+                  value: "pytest tests/test_mlops_drift_retraining.py -q"
+    - name: python-stage
+      inputs:
+        parameters:
+          - name: cmd
+      container:
+        image: ghcr.io/cayoesn/llm-mlops-multimodal-platform:latest
+        command: ["sh", "-c"]
+        args: ["{{inputs.parameters.cmd}}"]

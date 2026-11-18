@@ -1,0 +1,51 @@
+{
+  "title": "OmniPulse AI — 3D MLOps, LLMOps & Multimodal Observability",
+  "uid": "omnipulse-3d-obs",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Dimension 1: Infrastructure Telemetry (CPU / RAM / VRAM / Parquet Storage)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "omnipulse_infrastructure_resource", "legendFormat": "{{resource}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Dimension 2: Inference Throughput & p95 Latency Across Pillars",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(omnipulse_inference_latency_seconds_bucket[5m])) by (le, pillar))",
+          "legendFormat": "p95 {{pillar}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Dimension 3: Classical MLOps Quality (ROC-AUC, F1 & PSI Drift)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "omnipulse_model_quality_score{pillar=\"mlops\"}", "legendFormat": "{{metric}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Dimension 3: LLMOps & Multimodal Quality (RAGAS, SNR, WER, JSD & Synergy)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "omnipulse_model_quality_score{pillar=~\"llmops|multimodal.*\"}",
+          "legendFormat": "{{pillar}}.{{metric}}"
+        }
+      ]
+    }
+  ]
+}

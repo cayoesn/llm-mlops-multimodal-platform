@@ -1,0 +1,69 @@
+name: OmniPulse 3-Stage ML/LLM CI/CD & CML Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  stage1_unit_and_static_gates:
+    name: "Stage 1 — Static Analysis, Strict Typing & Unit Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Provision Python 3.12 virtualenv
+        run: |
+          uv venv .venv --python 3.12 --seed
+          uv pip install --python .venv/bin/python -e ".[dev]"
+      - name: Ruff Lint & Format Check
+        run: |
+          .venv/bin/ruff check app tests dags feature_repo
+          .venv/bin/ruff format --check app tests dags feature_repo
+      - name: Strict Mypy Type Verification
+        run: .venv/bin/mypy app dags feature_repo
+      - name: Unit & Algorithmic Invariants Suite
+        run: >
+          .venv/bin/pytest
+          tests/test_resilience_and_observability.py
+          tests/test_llmops_rag_cache_guardrails.py
+          tests/test_llmops_ragas_lora.py
+          tests/test_multimodal_audio_vision_video.py -v
+
+  stage2_mlops_multimodal_integration:
+    name: "Stage 2 — Feast/DVC/MLflow, RAGAS & Multimodal Integration (>=95% Cov)"
+    needs: stage1_unit_and_static_gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Provision Python 3.12 virtualenv
+        run: |
+          uv venv .venv --python 3.12 --seed
+          uv pip install --python .venv/bin/python -e ".[dev]"
+      - name: Full Integration & Coverage Gate (>=95%)
+        run: .venv/bin/pytest tests -v --cov=app --cov-report=term-missing --cov-fail-under=95
+      - name: Execute DVC Pipeline & Generate CML Markdown Report
+        run: |
+          .venv/bin/python -c "
+          from app.mlops.dvc_pipeline import DVCPipelineRunner
+          from app.mlops.mlflow_lifecycle import ExperimentMetrics
+          runner = DVCPipelineRunner()
+          res = runner.run_pipeline(force=True)
+          base = ExperimentMetrics(roc_auc=0.85, avg_prec=0.84, f1_score=0.81, brier_loss=0.14)
+          report = runner.generate_cml_pr_report(baseline=base, candidate=res.metrics)
+          open('cml_report.md', 'w').write(report)
+          "
+          cat cml_report.md >> "$GITHUB_STEP_SUMMARY"
+
+  stage3_container_delivery:
+    name: "Stage 3 — Multi-Stage Container Build & Compose Validation"
+    needs: stage2_mlops_multimodal_integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Docker Compose Topology
+        run: docker compose config -q
+      - name: Build Production Container Image
+        run: docker build -t llm-mlops-multimodal-platform:ci .

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: omnipulse-platform-svc
+  namespace: mlops-prod
+  labels:
+    app: omnipulse-platform
+spec:
+  type: LoadBalancer
+  selector:
+    app: omnipulse-platform
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8017
