@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -171,6 +172,39 @@ class MLflowLifecycleManager:
         self._runs: dict[str, TrackedExperimentRun] = {}
         self._registry: dict[int, RegisteredModelVersion] = {}
         self._ort_sessions: dict[str, ort.InferenceSession] = {}
+        self._rehydrate_from_disk()
+
+    def _registry_index_path(self) -> Path:
+        """Return path to the persisted JSON model registry index."""
+        return self._artifact_root / "registry_index.json"
+
+    def _persist_registry_locked(self) -> None:
+        """Persist current MLflow Model Registry state atomically under lock."""
+        self._artifact_root.mkdir(parents=True, exist_ok=True)
+        serialized = [self._registry[v].model_dump() for v in sorted(self._registry)]
+        self._registry_index_path().write_text(
+            json.dumps(serialized, indent=2),
+            encoding="utf-8",
+        )
+
+    def _rehydrate_from_disk(self) -> None:
+        """Reload persisted runs and registered model versions on warm startup."""
+        runs_dir = self._artifact_root / "runs"
+        if runs_dir.exists():
+            for meta_file in sorted(runs_dir.glob("*/run_metadata.json")):
+                raw_run = json.loads(meta_file.read_text(encoding="utf-8"))
+                run_obj = TrackedExperimentRun.model_validate(raw_run)
+                if Path(run_obj.onnx_artifact_path).exists():
+                    self._runs[run_obj.run_id] = run_obj
+
+        reg_file = self._registry_index_path()
+        if reg_file.exists():
+            raw_list = json.loads(reg_file.read_text(encoding="utf-8"))
+            if isinstance(raw_list, list):
+                for entry in raw_list:
+                    reg_obj = RegisteredModelVersion.model_validate(entry)
+                    if Path(reg_obj.onnx_artifact_path).exists():
+                        self._registry[reg_obj.version] = reg_obj
 
     def load_mlproject_spec(self) -> dict[str, Any]:
         """Parse and validate the standardized MLflow Projects YAML specification."""
@@ -305,6 +339,7 @@ class MLflowLifecycleManager:
                 promoted_at_utc=datetime.now(UTC).isoformat(),
             )
             self._registry[version_num] = registered
+            self._persist_registry_locked()
         log_info(_LOGGER, "mlflow_model_registered", version=version_num, run_id=run_id)
         return registered
 
@@ -335,6 +370,7 @@ class MLflowLifecycleManager:
                 }
             )
             self._registry[version] = updated
+            self._persist_registry_locked()
         log_event(
             _LOGGER,
             "mlflow_stage_transition",
@@ -367,6 +403,9 @@ class MLflowLifecycleManager:
         """Execute deterministic Champion/Challenger A/B routing over ONNX Runtime."""
         if len(feature_vector) != 4:
             raise ValidationLayerError("Risk model expects exactly 4 features.")
+        arr = np.asarray([feature_vector], dtype=np.float32)
+        if not np.all(np.isfinite(arr)):
+            raise ValidationLayerError("Feature vector values must be finite numbers.")
         started_ns = time.perf_counter_ns()
 
         with self._lock:
@@ -388,7 +427,6 @@ class MLflowLifecycleManager:
                 selected = staging_candidates[-1]
 
         session = self._get_session(selected.onnx_artifact_path)
-        arr = np.asarray([feature_vector], dtype=np.float32)
         prob = float(session.run(None, {"features": arr})[0][0, 0])
         band: Literal["LOW", "MEDIUM", "HIGH"] = (
             "HIGH" if prob >= 0.70 else ("MEDIUM" if prob >= 0.35 else "LOW")

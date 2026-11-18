@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import io
 import logging
 import time
 from typing import Any, Literal
 
 import numpy as np
 from fastapi import APIRouter, Query, Request, Response, WebSocket, WebSocketDisconnect
-from PIL import Image, UnidentifiedImageError
+from pydantic import ValidationError
 
 from app.api.schemas import (
     AuditVerifyResponse,
@@ -29,9 +28,18 @@ from app.api.schemas import (
     WebSocketStreamUtterance,
 )
 from app.config import get_settings
-from app.core.exceptions import ValidationLayerError
+from app.core.exceptions import (
+    GuardrailViolationError,
+    ModalitySyncError,
+    ValidationLayerError,
+)
 from app.core.finops_roi import FinOpsROIEngine, FinOpsROIReport, FinOpsWorkloadInput
-from app.core.observability import bind_request_context, get_observability_hub, log_info
+from app.core.observability import (
+    bind_request_context,
+    get_observability_hub,
+    log_info,
+    log_warning,
+)
 from app.llmops.lora_rlhf_loop import (
     LoRAAdaptationSummary,
     LoRAAdapterLayer,
@@ -119,17 +127,16 @@ def _decode_base64_bytes(encoded: str) -> bytes:
         raise ValidationLayerError("Invalid base64-encoded media payload.") from exc
 
 
-def _decode_video_frames(frames_b64: list[str]) -> np.ndarray:
-    """Decode base64 frame list into an (F, 32, 32, 3) uint8 RGB video tensor."""
+def _decode_video_frames(
+    frames_b64: list[str],
+    container: PlatformRuntimeContainer,
+) -> np.ndarray:
+    """Decode base64 frame list via VisionVideoMLOpsPipeline lazy decompression-bomb guard."""
     decoded_frames: list[np.ndarray] = []
+    vision_pipe = container.multimodal_engine.vision_pipeline
     for raw_b64 in frames_b64:
         frame_bytes = _decode_base64_bytes(raw_b64)
-        try:
-            with Image.open(io.BytesIO(frame_bytes)) as img:
-                resized = img.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR)
-                decoded_frames.append(np.asarray(resized, dtype=np.uint8))
-        except (UnidentifiedImageError, OSError, SyntaxError) as exc:
-            raise ValidationLayerError("Malformed video frame image payload.") from exc
+        decoded_frames.append(vision_pipe.decode_rgb_frame(frame_bytes))
     return np.stack(decoded_frames, axis=0)
 
 
@@ -321,7 +328,11 @@ async def multimodal_inspect(
     """Run concurrent Text + Audio + Image + Video inspection and Cross-Modal Synergy audit."""
     container = _get_container(request)
     image_bytes = _decode_base64_bytes(payload.image_base64)
-    video_tensor = await asyncio.to_thread(_decode_video_frames, payload.video_frames_base64)
+    video_tensor = await asyncio.to_thread(
+        _decode_video_frames,
+        payload.video_frames_base64,
+        container,
+    )
     waveform = np.asarray(payload.audio_samples, dtype=np.float32)
 
     inspection_in = MultimodalInspectionInput(
@@ -343,27 +354,37 @@ async def multimodal_websocket_stream(websocket: WebSocket) -> None:
     """Stream real-time utterance ASR + ONNX frame inspection over low-latency WebSocket."""
     await websocket.accept()
     container: PlatformRuntimeContainer = websocket.app.state.container
-    bind_request_context()
     try:
         while True:
             raw_msg = await websocket.receive_json()
+            bind_request_context()
             started_ns = time.perf_counter_ns()
-            chunk = WebSocketStreamUtterance.model_validate(raw_msg)
-            waveform = np.asarray(chunk.audio_samples, dtype=np.float32)
-            frame_bytes = _decode_base64_bytes(chunk.frame_base64)
+            try:
+                chunk = WebSocketStreamUtterance.model_validate(raw_msg)
+                waveform = np.asarray(chunk.audio_samples, dtype=np.float32)
+                frame_bytes = _decode_base64_bytes(chunk.frame_base64)
 
-            audio_task = asyncio.to_thread(
-                container.multimodal_engine.audio_pipeline.process_utterance,
-                waveform,
-                speaker_id=chunk.speaker_id,
-                consent_token=chunk.voice_consent_token,
-                prompt_hint=chunk.prompt_hint,
-            )
-            vision_task = asyncio.to_thread(
-                container.multimodal_engine.vision_pipeline.inspect_image_bytes,
-                frame_bytes,
-            )
-            audio_rep, vision_rep = await asyncio.gather(audio_task, vision_task)
+                audio_task = asyncio.to_thread(
+                    container.multimodal_engine.audio_pipeline.process_utterance,
+                    waveform,
+                    speaker_id=chunk.speaker_id,
+                    consent_token=chunk.voice_consent_token,
+                    prompt_hint=chunk.prompt_hint,
+                )
+                vision_task = asyncio.to_thread(
+                    container.multimodal_engine.vision_pipeline.inspect_image_bytes,
+                    frame_bytes,
+                )
+                audio_rep, vision_rep = await asyncio.gather(audio_task, vision_task)
+            except GuardrailViolationError as exc:
+                log_warning(_LOGGER, "websocket_guardrail_violation", exc=exc)
+                await websocket.send_json({"error": "guardrail_violation", "detail": str(exc)})
+                continue
+            except (ValidationLayerError, ModalitySyncError, ValidationError) as exc:
+                log_warning(_LOGGER, "websocket_validation_rejected", exc=exc)
+                await websocket.send_json({"error": "validation_error", "detail": str(exc)})
+                continue
+
             latency_ms = max(0.05, (time.perf_counter_ns() - started_ns) / 1_000_000.0)
 
             log_info(

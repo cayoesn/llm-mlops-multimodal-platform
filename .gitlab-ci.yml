@@ -29,5 +29,5 @@ deploy_airflow_dags_and_container:
   only:
     - main
   script:
-    - python -c "from dags.omnipulse_mlops_dag import build_airflow_dag_spec; assert len(build_airflow_dag_spec().tasks) == 5"
+    - python -c "from dags.omnipulse_mlops_dag import build_omnipulse_airflow_dag_spec; assert len(build_omnipulse_airflow_dag_spec()['topological_order']) == 6"
     - echo "Airflow DAG omnipulse_mlops_dag.py verified and ready for scheduler sync."

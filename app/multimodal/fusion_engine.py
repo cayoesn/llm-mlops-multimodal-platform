@@ -294,11 +294,11 @@ class MultimodalFusionEngine:
         covered_modalities = sum(
             1
             for phrase in (
-                audio_rep.transcript.split()[0],
-                image_semantic.split()[0],
-                video_semantic.split()[0],
+                audio_rep.transcript,
+                image_semantic,
+                video_semantic,
             )
-            if phrase.lower() in summary.lower()
+            if phrase.split() and phrase.split()[0].lower() in summary.lower()
         )
         grounding_cov = round((covered_modalities + 1) / 4.0, 4)
         mm_overall = round(

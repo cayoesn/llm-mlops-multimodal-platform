@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +78,7 @@ class DVCPipelineRunner:
             artifact_root=self._workspace_dir / "mlflow_store",
             mlproject_path=repo_root / "MLproject",
         )
+        self._lock = threading.RLock()
 
     @property
     def feast_service(self) -> FeastFeatureService:
@@ -114,6 +117,11 @@ class DVCPipelineRunner:
 
     def run_pipeline(self, *, force: bool = False) -> DVCPipelineResult:
         """Execute the 6-stage DVC pipeline skipping unchanged cached stages in O(1)."""
+        with self._lock:
+            return self._run_pipeline_locked(force=force)
+
+    def _run_pipeline_locked(self, *, force: bool) -> DVCPipelineResult:
+        """Locked implementation of the 6-stage DVC execution and warm-start rehydration."""
         dvc_spec, params = self._load_specs()
         stages_map: dict[str, dict[str, Any]] = dvc_spec["stages"]
         self._workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -147,6 +155,19 @@ class DVCPipelineRunner:
             upstream_chain = sig
 
             if not force and prev_hashes.get(stage_name) == sig and metrics_file.exists():
+                if stage_name == "feast_materialize" and self._feast.offline_parquet_path.exists():
+                    self._feast.materialize_to_online_store()
+                elif (
+                    stage_name == "register"
+                    and not self._mlflow.list_versions()
+                    and tracked_run_id is not None
+                ):
+                    reg = self._mlflow.register_model_version(tracked_run_id)
+                    promoted = self._mlflow.transition_model_stage(
+                        reg.version,
+                        target_stage="Production",
+                    )
+                    registered_ver = promoted.version
                 skipped += 1
                 continue
 
@@ -291,13 +312,18 @@ class DVCPipelineRunner:
         return "\n".join(lines)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entrypoint for running the DVC + Feast + MLflow pipeline."""
+    parser = argparse.ArgumentParser(description="Execute OmniPulse DVC pipeline stages.")
+    parser.add_argument("--stage", default="all", help="Optional target DVC stage label.")
+    parser.add_argument("--force", action="store_true", help="Force full stage recomputation.")
+    args = parser.parse_args(argv)
     runner = DVCPipelineRunner()
-    result = runner.run_pipeline()
+    result = runner.run_pipeline(force=bool(args.force))
     log_info(
         _LOGGER,
         "cli_pipeline_finished",
+        requested_stage=str(args.stage),
         stages_executed=result.stages_executed,
         cached_skipped=result.cached_stages_skipped,
         roc_auc=result.metrics.roc_auc,

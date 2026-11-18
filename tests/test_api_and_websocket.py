@@ -308,3 +308,104 @@ def test_redis_online_fallback_and_domain_exception_handlers(
         ).status_code
         == 409
     )
+
+
+def test_warm_start_rehydrates_feast_and_mlflow_when_dvc_stages_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensure warm restart with cached DVC lock hashes still serves Feast & MLflow predictions."""
+    from app.config import reset_settings_cache
+    from app.mlops.dvc_pipeline import DVCPipelineRunner
+
+    runtime_dir = tmp_path / "warm_runtime"
+    monkeypatch.setenv("OMNIPULSE_ARTIFACT_DIR", str(runtime_dir))
+    reset_settings_cache()
+
+    cold_runner = DVCPipelineRunner()
+    first = cold_runner.run_pipeline(force=False)
+    assert first.stages_executed == 6
+
+    warm_app = create_app(max_request_body_bytes=512_000)
+    with TestClient(warm_app) as warm_client:
+        pred = warm_client.post("/api/v1/mlops/predict", json={"customer_id": "cust-0001"})
+        assert pred.status_code == 200
+        assert 0.0 <= pred.json()["risk_probability"] <= 1.0
+
+
+def test_chunked_streaming_body_limit_video_bomb_guard_and_ws_error_recovery(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify chunked 413 enforcement, video frame bomb guard, and WS structured error frames."""
+    from collections.abc import Iterator
+
+    from fastapi import FastAPI
+
+    def _chunked_payload() -> Iterator[bytes]:
+        for _ in range(7):
+            yield b"a" * 90_000
+
+    chunked_resp = api_client.post("/api/v1/llmops/chat", content=_chunked_payload())
+    assert chunked_resp.status_code == 413
+
+    bad_cl = api_client.get("/health", headers={"Content-Length": "-5"})
+    assert bad_cl.status_code == 400
+    non_int_cl = api_client.get("/health", headers={"Content-Length": "abc"})
+    assert non_int_cl.status_code == 400
+
+    assert isinstance(api_client.app, FastAPI)
+    container = api_client.app.state.container
+    monkeypatch.setattr(container.multimodal_engine.vision_pipeline, "_max_side", 64)
+
+    safe_small_b64 = _make_b64_png(damaged=True)
+    bomb_arr = np.zeros((96, 96, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(bomb_arr, mode="RGB").save(buf, format="PNG")
+    bomb_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    bomb_resp = api_client.post(
+        "/api/v1/multimodal/inspect",
+        json={
+            "case_id": "case-video-bomb",
+            "speaker_id": "cust-ws-01",
+            "voice_consent_token": issue_voice_consent_token("cust-ws-01"),
+            "claim_text": "damaged parcel",
+            "audio_samples": _make_speech_samples(),
+            "image_base64": safe_small_b64,
+            "video_frames_base64": [bomb_b64],
+        },
+    )
+    assert bomb_resp.status_code == 422
+    monkeypatch.setattr(container.multimodal_engine.vision_pipeline, "_max_side", 4096)
+
+    with api_client.websocket_connect("/ws/v1/multimodal/stream") as ws:
+        ws.send_json(
+            {
+                "utterance_id": "utt-forged",
+                "speaker_id": "cust-ws-01",
+                "voice_consent_token": "forged-token",
+                "audio_samples": _make_speech_samples(),
+                "frame_base64": safe_small_b64,
+            },
+        )
+        err_event = ws.receive_json()
+        assert err_event["error"] == "guardrail_violation"
+
+        ws.send_json({"utterance_id": ""})
+        val_err_event = ws.receive_json()
+        assert val_err_event["error"] == "validation_error"
+
+        ws.send_json(
+            {
+                "utterance_id": "utt-valid-after-err",
+                "speaker_id": "cust-ws-01",
+                "voice_consent_token": issue_voice_consent_token("cust-ws-01"),
+                "audio_samples": _make_speech_samples(),
+                "prompt_hint": "broken glass screen",
+                "frame_base64": safe_small_b64,
+            },
+        )
+        ok_event = ws.receive_json()
+        assert ok_event["utterance_id"] == "utt-valid-after-err"
+        assert ok_event["visual_label"] == "damaged_parcel"

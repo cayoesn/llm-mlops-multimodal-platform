@@ -330,6 +330,10 @@ class VisionVideoMLOpsPipeline:
         except (UnidentifiedImageError, OSError, SyntaxError) as exc:
             raise ValidationLayerError("Malformed or unsupported image byte stream.") from exc
 
+    def decode_rgb_frame(self, raw_bytes: bytes) -> np.ndarray:
+        """Safely validate image header bounds before decoding and resizing to 32x32 RGB."""
+        return self._safe_decode_rgb(raw_bytes)
+
     def preprocess_and_augment(
         self,
         image_bytes: bytes,

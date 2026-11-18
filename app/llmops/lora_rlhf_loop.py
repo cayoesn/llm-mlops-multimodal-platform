@@ -77,6 +77,11 @@ class LoRAAdapterLayer:
         """Return ratio of LoRA trainable parameters to frozen base parameters."""
         return round(self.trainable_parameters / max(1, self.frozen_base_parameters), 6)
 
+    @property
+    def adapter_lock(self) -> threading.RLock:
+        """Expose re-entrant adapter lock for synchronized RLHF/DPO parameter updates."""
+        return self._lock
+
     def project(self, x: np.ndarray) -> np.ndarray:
         """Compute forward pass y = W_0 x + (alpha / r) B (A x)."""
         with self._lock:
@@ -126,40 +131,40 @@ class RLHFAdaptationLoop:
 
     def run_dpo_adaptation_step(self, epochs: int = 10) -> LoRAAdaptationSummary:
         """Optimize LoRA A & B on buffered RLHF pairs keeping W_0 strictly frozen."""
-        with self._lock:
+        with self._lock, self._adapter.adapter_lock:
             if not self._buffer:
                 raise ValueError("No human preference pairs recorded in RLHF buffer.")
             snapshot = list(self._buffer)
 
-        prompts = np.asarray([p.prompt_embedding for p in snapshot], dtype=np.float32)
-        chosen = np.asarray([p.chosen_embedding for p in snapshot], dtype=np.float32)
-        rejected = np.asarray([p.rejected_embedding for p in snapshot], dtype=np.float32)
-        diffs = chosen - rejected
+            prompts = np.asarray([p.prompt_embedding for p in snapshot], dtype=np.float32)
+            chosen = np.asarray([p.chosen_embedding for p in snapshot], dtype=np.float32)
+            rejected = np.asarray([p.rejected_embedding for p in snapshot], dtype=np.float32)
+            diffs = chosen - rejected
 
-        initial_margin, _ = self._mean_margin(prompts, diffs)
+            initial_margin, _ = self._mean_margin(prompts, diffs)
 
-        for _ in range(max(1, epochs)):
-            for p_vec, diff_vec in zip(prompts, diffs, strict=True):
-                projected = self._adapter.project(p_vec)
-                margin = float(np.dot(projected, diff_vec))
-                sigmoid_weight = float(1.0 / (1.0 + np.exp(np.clip(margin, -20.0, 20.0))))
-                scale = self._lr * sigmoid_weight * self._adapter.scaling
+            for _ in range(max(1, epochs)):
+                for p_vec, diff_vec in zip(prompts, diffs, strict=True):
+                    projected = self._adapter.project(p_vec)
+                    margin = float(np.dot(projected, diff_vec))
+                    sigmoid_weight = float(1.0 / (1.0 + np.exp(np.clip(margin, -20.0, 20.0))))
+                    scale = self._lr * sigmoid_weight * self._adapter.scaling
 
-                hidden = self._adapter.lora_a @ p_vec
-                grad_b = np.outer(diff_vec, hidden)
-                grad_a = np.outer(self._adapter.lora_b.T @ diff_vec, p_vec)
+                    hidden = self._adapter.lora_a @ p_vec
+                    grad_b = np.outer(diff_vec, hidden)
+                    grad_a = np.outer(self._adapter.lora_b.T @ diff_vec, p_vec)
 
-                self._adapter.lora_b += scale * grad_b
-                self._adapter.lora_a += scale * grad_a
+                    self._adapter.lora_b += scale * grad_b
+                    self._adapter.lora_a += scale * grad_a
 
-        post_margin, acc = self._mean_margin(prompts, diffs)
-        return LoRAAdaptationSummary(
-            rank=self._adapter.rank,
-            trainable_parameters=self._adapter.trainable_parameters,
-            frozen_base_parameters=self._adapter.frozen_base_parameters,
-            trainable_parameter_ratio=self._adapter.trainable_parameter_ratio,
-            pairs_evaluated=len(snapshot),
-            initial_margin=round(initial_margin, 5),
-            post_margin=round(post_margin, 5),
-            preference_accuracy=round(acc, 5),
-        )
+            post_margin, acc = self._mean_margin(prompts, diffs)
+            return LoRAAdaptationSummary(
+                rank=self._adapter.rank,
+                trainable_parameters=self._adapter.trainable_parameters,
+                frozen_base_parameters=self._adapter.frozen_base_parameters,
+                trainable_parameter_ratio=self._adapter.trainable_parameter_ratio,
+                pairs_evaluated=len(snapshot),
+                initial_margin=round(initial_margin, 5),
+                post_margin=round(post_margin, 5),
+                preference_accuracy=round(acc, 5),
+            )

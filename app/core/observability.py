@@ -40,6 +40,7 @@ _PII_MASTER_PATTERN = re.compile(
     r"(?P<bearer>Bearer\s+[A-Za-z0-9._\-]{8,})"
     r"|(?P<card>\b(?:\d{4}[-\s]?){3}\d{4}\b)"
     r"|(?P<cpf>\b\d{3}\.\d{3}\.\d{3}-\d{2}\b|\b\d{11}\b)"
+    r"|(?P<phone>(?:\+\d{1,3}[\s\-]?)?\(?\d{2,3}\)?[\s\-]?\d{4,5}-\d{4}\b)"
     r"|(?P<email>\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b)"
 )
 
@@ -47,6 +48,7 @@ _REDACTION_TOKENS: dict[str, str] = {
     "bearer": "Bearer [REDACTED_TOKEN]",
     "card": "[REDACTED_CARD]",
     "cpf": "[REDACTED_CPF]",
+    "phone": "[REDACTED_PHONE]",
     "email": "[REDACTED_EMAIL]",
 }
 

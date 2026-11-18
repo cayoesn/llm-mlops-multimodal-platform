@@ -71,12 +71,15 @@ def test_guardrails_reversible_pii_vault_injection_and_toxicity() -> None:
     """GuardrailsEngine tokenizes PII reversibly and blocks prompt injection & toxic text."""
     guard = GuardrailsEngine(max_toxicity_score=0.35)
     session = guard.sanitize_inbound(
-        "Customer alice@corp.com CPF 123.456.789-01 disputes card 4532-1111-2222-3333."
+        "Customer alice@corp.com phone +55 (11) 98765-4321 CPF 123.456.789-01 "
+        "disputes card 4532-1111-2222-3333."
     )
     assert "alice@corp.com" not in session.sanitized_text
+    assert "98765-4321" not in session.sanitized_text
     assert "123.456.789-01" not in session.sanitized_text
     assert "4532-1111-2222-3333" not in session.sanitized_text
     assert "<PII_EMAIL_1>" in session.sanitized_text
+    assert "<PII_PHONE_1>" in session.sanitized_text
 
     restored = guard.restore_outbound(
         f"Verified ticket for {'<PII_EMAIL_1>'} under LGPD audit.",
@@ -140,3 +143,43 @@ async def test_hybrid_rag_and_serving_gateway_caches_repeated_queries() -> None:
     )
     assert second.cache_hit is True
     assert gateway.backend_invocations == 1
+
+
+@pytest.mark.asyncio
+async def test_ollama_and_vllm_pooled_http_backends_map_downstream_status() -> None:
+    """Ensure Ollama and vLLM adapters use pooled httpx clients and DownstreamHTTPStatusError."""
+    import httpx
+
+    from app.core.exceptions import DownstreamHTTPStatusError
+    from app.llmops.serving_gateway import OllamaHTTPBackend, VLLMHTTPBackend
+
+    def _mock_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/generate":
+            return httpx.Response(200, json={"response": "Ollama grounded completion."})
+        if req.url.path == "/v1/chat/completions":
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "vLLM grounded completion."}}]},
+            )
+        return httpx.Response(429, text="rate limited")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_mock_handler))
+    try:
+        ollama = OllamaHTTPBackend("http://ollama.local", client=client)
+        assert await ollama.generate("sys", "q", "ctx") == "Ollama grounded completion."
+
+        vllm = VLLMHTTPBackend("http://vllm.local", client=client)
+        assert await vllm.generate("sys", "q", "ctx") == "vLLM grounded completion."
+
+        err_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(429, text="throttled")),
+        )
+        try:
+            throttled_vllm = VLLMHTTPBackend("http://vllm.local", client=err_client)
+            with pytest.raises(DownstreamHTTPStatusError) as exc_info:
+                await throttled_vllm.generate("sys", "q", "ctx")
+            assert exc_info.value.status_code == 429
+        finally:
+            await err_client.aclose()
+    finally:
+        await client.aclose()

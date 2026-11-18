@@ -50,7 +50,7 @@ def test_settings_handles_empty_env_strings_gracefully(monkeypatch: pytest.Monke
 
 def test_noop_circuit_breaker_always_closed() -> None:
     """NoOpCircuitBreaker operates in O(1) and never blocks execution."""
-    breaker = get_circuit_breaker("saori_bypass_service", enabled=False)
+    breaker = get_circuit_breaker("omnipulse_noop_bypass_service", enabled=False)
     assert isinstance(breaker, NoOpCircuitBreaker)
     assert breaker.state == "CLOSED"
     assert breaker.consecutive_failures == 0

@@ -13,6 +13,7 @@ _VAULT_PII_PATTERN = re.compile(
     r"(?P<EMAIL>\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b)"
     r"|(?P<CARD>\b(?:\d{4}[-\s]?){3}\d{4}\b)"
     r"|(?P<CPF>\b\d{3}\.\d{3}\.\d{3}-\d{2}\b|\b\d{11}\b)"
+    r"|(?P<PHONE>(?:\+\d{1,3}[\s\-]?)?\(?\d{2,3}\)?[\s\-]?\d{4,5}-\d{4}\b)"
 )
 
 _PROMPT_INJECTION_PATTERN = re.compile(

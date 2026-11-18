@@ -142,15 +142,19 @@ def compute_word_error_rate(reference: str, hypothesis: str) -> float:
     if not ref_words:
         return 0.0 if not hyp_words else 1.0
 
-    m = len(ref_words)
-    n = len(hyp_words)
+    ref_len = len(ref_words)
+    longer, shorter = (
+        (ref_words, hyp_words) if len(ref_words) >= len(hyp_words) else (hyp_words, ref_words)
+    )
+    m = len(longer)
+    n = len(shorter)
     prev_row = list(range(n + 1))
 
     for i in range(1, m + 1):
         curr_row = [i] + [0] * n
-        ref_tok = ref_words[i - 1]
+        long_tok = longer[i - 1]
         for j in range(1, n + 1):
-            sub_cost = 0 if ref_tok == hyp_words[j - 1] else 1
+            sub_cost = 0 if long_tok == shorter[j - 1] else 1
             curr_row[j] = min(
                 prev_row[j] + 1,
                 curr_row[j - 1] + 1,
@@ -158,7 +162,7 @@ def compute_word_error_rate(reference: str, hypothesis: str) -> float:
             )
         prev_row = curr_row
 
-    return round(prev_row[n] / m, 6)
+    return round(prev_row[n] / ref_len, 6)
 
 
 class WhisperTranscription(BaseModel):

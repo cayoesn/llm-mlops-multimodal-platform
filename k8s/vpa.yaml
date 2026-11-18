@@ -9,7 +9,7 @@ spec:
     kind: Deployment
     name: omnipulse-platform
   updatePolicy:
-    updateMode: "Auto"
+    updateMode: "Off"
   resourcePolicy:
     containerPolicies:
       - containerName: omnipulse-api

@@ -57,7 +57,7 @@ class MLOpsPipelineRunResponse(BaseModel):
 class MLOpsPredictRequest(BaseModel):
     """Real-time risk inference request resolved via Feast Online Store."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
     customer_id: str = Field(min_length=1)
     feature_override: list[float] | None = None
@@ -79,10 +79,10 @@ class MLOpsPredictResponse(BaseModel):
 class MLOpsDriftEvaluateRequest(BaseModel):
     """Statistical PSI/KS data drift and live accuracy concept drift evaluation request."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
-    reference_feature: list[float] = Field(min_length=10)
-    current_feature: list[float] = Field(min_length=10)
+    reference_feature: list[float] = Field(min_length=10, max_length=50_000)
+    current_feature: list[float] = Field(min_length=10, max_length=50_000)
     recent_accuracy: float = Field(ge=0.0, le=1.0)
     auto_retrain: bool = True
 
@@ -126,27 +126,27 @@ class LoRAAdaptRequest(BaseModel):
 class MultimodalInspectAPIRequest(BaseModel):
     """Omnichannel REST payload carrying Text, Audio waveform, Image, and Video keyframes."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
     case_id: str = Field(min_length=1)
     speaker_id: str = Field(min_length=1)
     voice_consent_token: str = Field(min_length=1)
     claim_text: str = Field(min_length=1)
-    audio_samples: list[float] = Field(min_length=64)
+    audio_samples: list[float] = Field(min_length=64, max_length=320_000)
     audio_prompt_hint: str = ""
     image_base64: str = Field(min_length=8)
-    video_frames_base64: list[str] = Field(min_length=1)
+    video_frames_base64: list[str] = Field(min_length=1, max_length=64)
     policy_contexts: list[str] = Field(default_factory=list)
 
 
 class WebSocketStreamUtterance(BaseModel):
     """Low-latency WebSocket multimodal chunk carrying live speech and camera frame."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
     utterance_id: str = Field(min_length=1)
     speaker_id: str = Field(min_length=1)
     voice_consent_token: str = Field(min_length=1)
-    audio_samples: list[float] = Field(min_length=64)
+    audio_samples: list[float] = Field(min_length=64, max_length=320_000)
     prompt_hint: str = ""
     frame_base64: str = Field(min_length=8)

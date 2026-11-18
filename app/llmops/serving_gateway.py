@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict
 
 from app.config import get_settings
+from app.core.exceptions import DownstreamHTTPStatusError
 from app.core.observability import get_observability_hub, log_info
 from app.core.resilience import ResilientExecutor, TokenBucketRateLimiter, get_circuit_breaker
 from app.llmops.guardrails import GuardrailsEngine
@@ -40,26 +41,88 @@ class LocalGroundedSynthesizer:
 
 
 class OllamaHTTPBackend:
-    """Async self-hosted Ollama (/api/generate) serving adapter."""
+    """Async self-hosted Ollama (/api/generate) serving adapter with connection pooling."""
 
-    def __init__(self, base_url: str, model: str = "llama3.2:3b") -> None:
-        """Configure Ollama endpoint and model tag."""
+    def __init__(
+        self,
+        base_url: str,
+        model: str = "llama3.2:3b",
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Configure Ollama endpoint, model tag, and reusable AsyncClient pool."""
         self._base_url = base_url.rstrip("/")
         self._model = model
+        self._owns_client = client is None
+        self._client = client if client is not None else httpx.AsyncClient(timeout=4.0)
+
+    async def aclose(self) -> None:
+        """Close the owned AsyncClient connection pool on shutdown."""
+        if self._owns_client:
+            await self._client.aclose()
 
     async def generate(self, system_prompt: str, user_query: str, context: str) -> str:
-        """Invoke Ollama HTTP generation API with connection pooling."""
+        """Invoke Ollama HTTP generation API mapping non-2xx responses to semantic errors."""
         prompt = f"{system_prompt}\n\nContext:\n{context}\n\nQuestion: {user_query}"
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            resp = await client.post(
-                f"{self._base_url}/api/generate",
-                json={"model": self._model, "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            if isinstance(body, dict) and isinstance(body.get("response"), str):
-                return str(body["response"])
-            return "Empty response from Ollama."
+        resp = await self._client.post(
+            f"{self._base_url}/api/generate",
+            json={"model": self._model, "prompt": prompt, "stream": False},
+        )
+        if resp.status_code >= 400:
+            raise DownstreamHTTPStatusError(resp.status_code, resp.text[:200])
+        body = resp.json()
+        if isinstance(body, dict) and isinstance(body.get("response"), str):
+            return str(body["response"])
+        return "Empty response from Ollama."
+
+
+class VLLMHTTPBackend:
+    """Async OpenAI-compatible vLLM (/v1/chat/completions) serving adapter with pooling."""
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str = "meta-llama/Llama-3.2-3B-Instruct",
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Configure vLLM endpoint, model identifier, and reusable AsyncClient pool."""
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._owns_client = client is None
+        self._client = client if client is not None else httpx.AsyncClient(timeout=4.0)
+
+    async def aclose(self) -> None:
+        """Close the owned AsyncClient connection pool on shutdown."""
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def generate(self, system_prompt: str, user_query: str, context: str) -> str:
+        """Invoke vLLM OpenAI-compatible chat completions endpoint."""
+        resp = await self._client.post(
+            f"{self._base_url}/v1/chat/completions",
+            json={
+                "model": self._model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": f"Context:\n{context}\n\nQuestion: {user_query}",
+                    },
+                ],
+                "temperature": 0.0,
+            },
+        )
+        if resp.status_code >= 400:
+            raise DownstreamHTTPStatusError(resp.status_code, resp.text[:200])
+        body = resp.json()
+        if isinstance(body, dict):
+            choices = body.get("choices")
+            if isinstance(choices, list) and choices:
+                msg = choices[0].get("message", {})
+                if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                    return str(msg["content"])
+        return "Empty response from vLLM."
 
 
 class LLMChatResponse(BaseModel):
@@ -95,9 +158,14 @@ class LLMServingGateway:
         """Wire RAG, Semantic Cache, Guardrails, Prompt Registry, and ResilientExecutor."""
         settings = get_settings()
         self.rag_engine = rag_engine if rag_engine is not None else HybridRAGEngine()
-        self.backend: LLMBackendProtocol = (
-            backend if backend is not None else LocalGroundedSynthesizer()
-        )
+        if backend is not None:
+            self.backend: LLMBackendProtocol = backend
+        elif settings.OMNIPULSE_LLM_BACKEND == "ollama":
+            self.backend = OllamaHTTPBackend(settings.OMNIPULSE_OLLAMA_BASE_URL)
+        elif settings.OMNIPULSE_LLM_BACKEND == "vllm":
+            self.backend = VLLMHTTPBackend(settings.OMNIPULSE_VLLM_BASE_URL)
+        else:
+            self.backend = LocalGroundedSynthesizer()
         self.cache = (
             cache
             if cache is not None
@@ -125,6 +193,11 @@ class LLMServingGateway:
         )
         self._lock = threading.RLock()
         self._backend_invocations = 0
+
+    async def aclose(self) -> None:
+        """Close pooled HTTP client resources if the active backend owns a connection pool."""
+        if isinstance(self.backend, (OllamaHTTPBackend, VLLMHTTPBackend)):
+            await self.backend.aclose()
 
     @property
     def backend_invocations(self) -> int:

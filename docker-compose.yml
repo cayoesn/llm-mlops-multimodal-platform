@@ -98,7 +98,7 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: omnipulse-admin
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
-      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_data:/var/lib/grafana
     depends_on:

@@ -357,7 +357,7 @@ def get_circuit_breaker(
     recovery_seconds: float = 30.0,
 ) -> CircuitBreakerProtocol:
     """Return a named CircuitBreaker or O(1) NoOpCircuitBreaker when disabled."""
-    if not enabled or service_name.startswith("saori_"):
+    if not enabled or service_name.startswith("omnipulse_noop_"):
         return _NOOP_SINGLETON
     with _registry_lock:
         existing = _breaker_registry.get(service_name)
