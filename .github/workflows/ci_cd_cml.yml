@@ -9,10 +9,10 @@ on:
 jobs:
   stage1_unit_and_static_gates:
     name: "Stage 1 — Static Analysis, Strict Typing & Unit Tests"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Provision Python 3.12 virtualenv
         run: |
           uv venv .venv --python 3.12 --seed
@@ -34,10 +34,10 @@ jobs:
   stage2_mlops_multimodal_integration:
     name: "Stage 2 — Feast/DVC/MLflow, RAGAS & Multimodal Integration (>=95% Cov)"
     needs: stage1_unit_and_static_gates
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Provision Python 3.12 virtualenv
         run: |
           uv venv .venv --python 3.12 --seed
@@ -60,9 +60,9 @@ jobs:
   stage3_container_delivery:
     name: "Stage 3 — Multi-Stage Container Build & Compose Validation"
     needs: stage2_mlops_multimodal_integration
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate Docker Compose Topology
         run: docker compose config -q
       - name: Build Production Container Image
