@@ -301,7 +301,7 @@ class ProductionTrafficSimulator:
         if scenario == "llmops_pii_redacted_chat":
             pii_resp = await self._container.llm_gateway.chat(
                 query=(
-                    "Customer CPF 123.456.789-01 and email cliente.sim@omnipulse.ai "
+                    "Customer CPF 123.456.789-01 and email customer.sim@omnipulse.ai "
                     "requests LGPD biometric voiceprint governance rules"
                 ),
                 tenant_id="sim-lgpd",

@@ -1,29 +1,29 @@
-# Design Curto — Simulador Contínuo de Tráfego de Produção (OmniPulse AI)
+# Short Design — Continuous Production Traffic Simulator (OmniPulse AI)
 
-- **Escopo dimensionado:** Mudança pequena e autocontida (*small change*) sobre a arquitetura existente do `llm-mlops-multimodal-platform`.
+- **Scoped Size:** Small, self-contained change built on top of the existing `llm-mlops-multimodal-platform` architecture.
 
-## 1. Intenção e Motivação (Intent & Why)
-Permitir observar a plataforma OmniPulse AI operando fim a fim como um ambiente vivo de produção — gerando logs JSON estruturados (com scrubbing LGPD), métricas 3D no Prometheus/Grafana, cadeia criptográfica HMAC-SHA256 e decisões reais nos 3 pilares sem precisar montar payloads manualmente.
+## 1. Intent & Why
+Enable live end-to-end observation of the OmniPulse AI platform operating as a production-like environment — emitting structured JSON logs (with LGPD PII scrubbing), 3D observability metrics in Prometheus/Grafana, an HMAC-SHA256 cryptographic audit chain, and live decisions across all three pillars without manually crafting request payloads.
 
-## 2. Objetivos, Não-Objetivos e Anti-Objetivos
-- **Objetivos (Goals):** Gerar tráfego sintético realista em loop contínuo cobrindo MLOps (Feast + ONNX + ondas de Data Drift com retreino automático), LLMOps (RAG, cache semântico, redação PII, bloqueio de *prompt injection* e adaptação LoRA/RLHF) e Multimodal (áudio + imagem + vídeo consistentes vs. contraditórios), com controle em tempo real via API/Swagger e via CLI (`make simulate`).
-- **Não-Objetivos (Non-Goals):** Não substitui ferramentas de *stress benchmark* distribuído (como Locust/k6) nem cria frontends web dedicados fora do Swagger, SSE e Grafana já existentes.
-- **Anti-Objetivos (Anti-Goals):** Jamais vazar memória em execuções longas (histórico estritamente limitado em buffer circular `O(1)`), jamais deixar tasks órfãs no shutdown da FastAPI e jamais iniciar tráfego oculto automaticamente em testes ou no boot padrão sem comando explícito.
+## 2. Goals, Non-Goals & Anti-Goals
+- **Goals:** Generate realistic synthetic traffic in a continuous loop covering MLOps (Feast + ONNX + Data Drift waves with automated retraining), LLMOps (RAG, semantic cache, PII redaction, prompt-injection blocking, and LoRA/RLHF adaptation), and Multimodal (consistent vs. contradictory audio + image + video inspections), with real-time control via API/Swagger and CLI (`make simulate`).
+- **Non-Goals:** Does not replace distributed stress-benchmarking tools (such as Locust or k6) and does not introduce dedicated web frontends beyond Swagger, SSE, and Grafana.
+- **Anti-Goals:** Never leak memory during long-running executions (history strictly bounded in an `O(1)` ring buffer), never leave orphaned tasks on FastAPI shutdown, and never auto-start hidden traffic during tests or default server boot without an explicit command.
 
-## 3. Restrições Técnicas (Constraints)
-- Conformidade estrita com o padrão do repositório: Python 3.12+, `mypy --strict`, `ruff` (linha <= 100), zero comentários inline `#` em código Python, zero chamadas diretas a `logger.*` fora de `app/core/observability.py`, e cobertura global de testes `>= 95%`.
+## 3. Technical Constraints
+- Strict adherence to repository engineering standards: Python 3.12+, `mypy --strict`, `ruff` (line length <= 100), zero inline `#` comments in Python code, zero direct `logger.*` calls outside `app/core/observability.py`, and overall test coverage `>= 95%`.
 
-## 4. Abordagens Avaliadas
-1. **Abordagem 1 (Escolhida) — Motor Híbrido: Task Assíncrona Controlável na API (`/api/v1/simulate/*` + Stream SSE) + CLI `make simulate`:** Loop assíncrono não-bloqueante (`asyncio.Task` + `asyncio.Event`) acoplado ao `PlatformRuntimeContainer`, controlável via Swagger (`/start`, `/stop`, `/status`, `/stream`) e acompanhado de CLI (`python -m app.simulator`) capaz de operar em modo local ou disparando requisições HTTP + WebSocket (`/ws/v1/multimodal/stream`) contra um servidor ativo. Entrega máxima observabilidade no Docker Compose/Grafana sem exigir reinício de containers.
-2. **Abordagem 2 — Apenas Script/Container Externo de Carga:** Mantém a API intocada e exige processo separado batendo via rede; descartada por não oferecer controle interativo pelo Swagger `/docs`.
-3. **Abordagem 3 — Loop Interno Fixo por Variável de Ambiente no Boot:** Liga o gerador apenas via `ENV` no `lifespan`; descartada por exigir reiniciar o serviço para pausar ou alterar a cadência.
+## 4. Evaluated Approaches
+1. **Approach 1 (Selected) — Hybrid Engine: Controllable Async Task in the API (`/api/v1/simulate/*` + SSE Stream) + `make simulate` CLI:** Non-blocking async loop (`asyncio.Task` + `asyncio.Event`) wired into `PlatformRuntimeContainer`, controllable via Swagger (`/start`, `/stop`, `/status`, `/stream`), paired with a CLI (`python -m app.simulator`) capable of running in-process or issuing live HTTP + WebSocket (`/ws/v1/multimodal/stream`) traffic against a running server. Delivers full Docker Compose/Grafana observability without requiring container restarts.
+2. **Approach 2 — External Load Script/Container Only:** Keeps the API untouched and requires a separate process sending traffic over the network; rejected because it provides no interactive control through Swagger `/docs`.
+3. **Approach 3 — Fixed Internal Boot Loop via Environment Variable:** Enables the generator solely via an `ENV` flag during `lifespan`; rejected because pausing or adjusting cadence requires restarting the service.
 
-## 5. Decisões Definidas pelo Usuário
-- Modo de execução: **gerador contínuo em loop** (em vez de disparo único em lote).
-- Arquitetura: **Abordagem 1** (motor assíncrono controlável via endpoints da API + suporte CLI).
+## 5. User-Defined Decisions
+- Execution mode: **continuous loop generator** (rather than a single batch burst).
+- Architecture: **Approach 1** (async engine controllable through API endpoints plus CLI support).
 
-## 6. Padrões Definidos pelo Construtor (Defaults Ajustáveis)
-- **Estado inicial:** Desligado por padrão no boot (`running=False`), iniciando apenas via `POST /api/v1/simulate/start` ou CLI.
-- **Cadência e ondas de anomalia:** Intervalo padrão de `1.5s` por ciclo (`0.05s` a `60.0s`), disparando uma onda sintética de *Data Drift* (`PSI > 0.20` -> retreino automático MLflow) a cada `8` ciclos (`drift_wave_every=8`).
-- **Memória e ciclo de vida:** Buffer circular `collections.deque(maxlen=200)` para os últimos eventos, contadores agregados por pilar/status protegidos e cancelamento gracioso garantido tanto em `POST /api/v1/simulate/stop` quanto no encerramento do `lifespan` em `app/main.py`.
-- **Modos do CLI (`Makefile`):** `make simulate` (executa e exibe o fluxo contínuo formatado no terminal) e `make simulate-api` (cliente externo exercitando REST + WebSocket `/ws/v1/multimodal/stream` em `http://localhost:8017`).
+## 6. Builder-Defined Defaults (Configurable)
+- **Initial state:** Disabled by default on boot (`running=False`), starting only via `POST /api/v1/simulate/start` or the CLI.
+- **Cadence & anomaly waves:** Default interval of `1.5s` per cycle (`0.05s` to `60.0s`), triggering a synthetic Data Drift wave (`PSI > 0.20` -> automated MLflow retraining) every `8` cycles (`drift_wave_every=8`).
+- **Memory & lifecycle:** Circular buffer `collections.deque(maxlen=200)` for recent events, thread-safe aggregate counters by pillar/outcome, and guaranteed graceful cancellation on both `POST /api/v1/simulate/stop` and `lifespan` teardown in `app/main.py`.
+- **CLI modes (`Makefile`):** `make simulate` (runs in-process and streams formatted events to the terminal) and `make simulate-api` (external client exercising REST + WebSocket `/ws/v1/multimodal/stream` against `http://localhost:8017`).
